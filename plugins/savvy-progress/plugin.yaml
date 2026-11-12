@@ -1,6 +1,6 @@
 name: savvy-progress
-version: "0.1.0"
-description: Session token and cost snapshot producer for the Hermes TUI progress widget
+version: "1.0.0"
+description: Session token, cache and cost snapshot for the Hermes TUI progress card
 provides_hooks:
   - post_tool_call
   - post_api_request

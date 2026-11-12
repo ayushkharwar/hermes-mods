@@ -11,7 +11,7 @@ no patch of the Hermes source.
 
 | Mod | Type | What it does |
 |---|---|---|
-| `savvy-progress` | plugin + widget | Live card for your current chat: model, tokens, cache hit rate, context usage, cost, and the cost of delegate children that chat spawned |
+| `savvy-progress` | plugin + widget | Live card for your current chat: model, tokens, cache hit rate, context usage, cost, burn rate, cache savings, today's spend across every session, and the cost of delegate children that chat spawned |
 | `filetree-rail` | plugin + widget | Ambient rail of files the agent read or wrote, plus a modal `/explorer` with keyboard navigation and a file preview |
 | `keepwarm` | plugin | `/keepwarm` replays the session's last API request with `max_tokens=1` on a timer, so the provider prompt cache stays warm until `/keepwarm-stop` |
 
@@ -26,6 +26,9 @@ bash scripts/install.sh
 `install.sh` copies the plugins into `$HERMES_HOME/plugins/`, the widgets into
 `$HERMES_HOME/tui-widgets/`, and enables each plugin. The Hermes gateway reloads plugins on
 `enable`, so no restart is usually needed. Widgets hot-load into a running TUI within a second.
+
+The `savvy-progress` card and `/progress` exist only in `hermes --tui`; `/svprogress` prints
+the same snapshot as text in either interface.
 
 Then, inside `hermes --tui`:
 

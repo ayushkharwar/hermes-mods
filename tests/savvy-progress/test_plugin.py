@@ -51,7 +51,18 @@ NEW_KEYS = {
     "context_tokens",
     "context_window",
 }
-CONTRACT_KEYS = BASE_KEYS | NEW_KEYS
+# The eight keys behind the burn, saved and today rows.
+SPEND_KEYS = {
+    "burn_usd_per_hour",
+    "burn_source",
+    "cache_saved_usd",
+    "cache_saved_source",
+    "day_cost_usd",
+    "day_source",
+    "day_sessions",
+    "day_window_s",
+}
+CONTRACT_KEYS = BASE_KEYS | NEW_KEYS | SPEND_KEYS
 DELEGATE_KEYS = {"count", "input_tokens", "output_tokens", "cache_read", "cost_usd", "cost_source"}
 
 COST_SOURCES = {"provider", "table", "none"}
@@ -366,6 +377,11 @@ def main() -> int:
 
     first_mtime = mtime(snapshot_path)
 
+    # The day row reads every session in the DB, and other live sessions keep changing it.
+    # Freeze it here: this block tests the change-detection, not the day totals.
+    real_day_spend = plugin._day_spend
+    setattr(plugin, "_day_spend", lambda now: {"cost_usd": 1.25, "cost_source": "table", "sessions": 2})
+
     # 3. Throttle: a pending data change inside the 1 s window must not rewrite the file.
     real_reader = plugin._read_totals
     real_totals = real_reader(session_id)
@@ -381,10 +397,29 @@ def main() -> int:
           f"mtime {first_mtime} -> {mtime(snapshot_path)}")
 
     # 4. Same data, throttle window expired: still no write (nothing changed).
+    #    Every input is pinned for this one comparison: this suite runs inside a live Hermes
+    #    session on the same DB, so the real totals, context and day row move between calls.
     setattr(plugin, "_read_totals", real_reader)
+    stable_totals = dict(real_reader(session_id))
+    real_context_reader = plugin._read_context_tokens
+    real_start_reader = plugin._read_session_start
+    stable_context = real_context_reader(session_id)
+    stable_start = real_start_reader(session_id)
+    setattr(plugin, "_read_totals", lambda sid: dict(stable_totals))
+    setattr(plugin, "_read_context_tokens", lambda sid: stable_context)
+    setattr(plugin, "_read_session_start", lambda sid: stable_start)
+    setattr(plugin, "_day_spend", lambda now: {"cost_usd": 1.25, "cost_source": "table", "sessions": 2})
     setattr(plugin, "_last_write", 0.0)
     callback(tool_name="terminal", args={}, result="ok", status="ok", session_id=session_id)
-    check("unchanged data did not rewrite the file", mtime(snapshot_path) == first_mtime)
+    stable_mtime = mtime(snapshot_path)
+    setattr(plugin, "_last_write", 0.0)
+    callback(tool_name="terminal", args={}, result="ok", status="ok", session_id=session_id)
+    check("unchanged data did not rewrite the file", mtime(snapshot_path) == stable_mtime,
+          f"mtime {stable_mtime} -> {mtime(snapshot_path)}")
+    setattr(plugin, "_day_spend", real_day_spend)
+    setattr(plugin, "_read_context_tokens", real_context_reader)
+    setattr(plugin, "_read_session_start", real_start_reader)
+    setattr(plugin, "_read_totals", real_reader)
 
     # 5. Changed data, throttle window expired: write happens.
     setattr(plugin, "_read_totals", lambda sid: dict(fake_totals))
@@ -677,8 +712,8 @@ def main() -> int:
             payload = fire(plugin, "golden-A")
             shapes.append(set(payload))
             run.append({k: v for k, v in payload.items() if k in BASE_KEYS and k != "ts"})
-    check("contract is exactly 19 keys", len(CONTRACT_KEYS) == 19, f"n={len(CONTRACT_KEYS)}")
-    check("every single-session payload has exactly the 19 contract keys",
+    check("contract size matches the key set", len(CONTRACT_KEYS) == 27, f"n={len(CONTRACT_KEYS)}")
+    check(f"every single-session payload has exactly the {len(CONTRACT_KEYS)} contract keys",
           all(shape == CONTRACT_KEYS for shape in shapes),
           f"n_keys={[len(s) for s in shapes]}")
     golden_cmp = [
@@ -867,8 +902,8 @@ def main() -> int:
               payload["context_tokens"] == 50_000, f"{payload['context_tokens']}")
         check("context_window comes from config.yaml model.context_length",
               payload["context_window"] == 1_000_000, f"{payload['context_window']}")
-        check("contract is 19 keys and none of the original 14 changed shape",
-              set(payload) == CONTRACT_KEYS and len(payload) == 19, f"n={len(payload)}")
+        check("contract keys unchanged in shape apart from the spend rows",
+              set(payload) == CONTRACT_KEYS and len(payload) == len(CONTRACT_KEYS), f"n={len(payload)}")
 
         own = plugin._read_totals(PARENT)
         check("the 14 original keys still describe the primary exactly",
@@ -988,10 +1023,12 @@ def main() -> int:
               fresh["total_cost_usd"] == fresh["cost_usd"] + fresh["delegates"]["cost_usd"]
               and fresh["delegates"]["count"] == 0,
               f"total={fresh['total_cost_usd']} delegates={fresh['delegates']['cost_usd']}")
+        session_only = "\n".join(line for line in fresh_card.splitlines()
+                                  if not line.strip().startswith("today"))
         check("21 the card shows none of the previous chat's numbers",
-              "300,000" not in fresh_card and "$0.5000" not in fresh_card
-              and "100,000" not in fresh_card,
-              fresh_card.splitlines()[3])
+              "300,000" not in session_only and "$0.5000" not in session_only
+              and "100,000" not in session_only,
+              session_only.splitlines()[3])
         check("21 the new chat got no phantom turn",
               (plugin._read_sessions(store).get(NEW_B) or {}).get("turn") == 0
               and (plugin._read_sessions(store).get(NEW_B) or {}).get("turns") == [],
@@ -1016,9 +1053,11 @@ def main() -> int:
               grown["input_tokens"] == 1500 and grown["output_tokens"] == 150
               and grown["api_calls"] == 3,
               f"in={grown['input_tokens']} out={grown['output_tokens']} calls={grown['api_calls']}")
+        grown_session_only = "\n".join(line for line in grown_card.splitlines()
+                                       if not line.strip().startswith("today"))
         check("21 the previous chat's 0.5 is not added to the new chat",
-              "300,000" not in grown_card and "0.5200" not in grown_card
-              and "0.5000" not in grown_card, grown_card.splitlines()[7])
+              "300,000" not in grown_session_only and "0.5200" not in grown_session_only
+              and "0.5000" not in grown_session_only, grown_session_only.splitlines()[7])
         check("21 the new chat's first delta is one turn",
               (plugin._read_sessions(store).get(NEW_B) or {}).get("turn") == 1
               and (plugin._read_sessions(store).get(NEW_B) or {}).get("turns", [{}])[-1].get("in") == 1500,
@@ -1145,7 +1184,7 @@ def main() -> int:
         check("23 chat A's own file has 2 delegates and 0.03 of child cost",
               own_a["delegates"]["count"] == 2 and abs(own_a["delegates"]["cost_usd"] - 0.03) < 1e-9,
               json.dumps(own_a["delegates"]))
-        check("23 chat A's own file is its own numbers, 19 keys",
+        check("23 chat A's own file is its own numbers, contract keys",
               own_a["session_id"] == SC_A and own_a["primary_session"] == SC_A
               and own_a["input_tokens"] == 1000 and set(own_a) == CONTRACT_KEYS,
               f"in={own_a['input_tokens']} keys={len(own_a)}")

@@ -10,6 +10,9 @@
  *   cache   ███████░░░░░  91.7%
  *   ctx     █░░░░░░░░░░░   3.4%
  *   cost          ~$0.0123
+ *   burn            ~$0.55/h
+ *   saved           ~$0.2401
+ *   today      ~$2.1871  25 chats
  *   agents   3   +$0.0412
  *
  * Column rules: the model is cut to its last path segment, every number is padded into
@@ -26,7 +29,7 @@
  *
  * Contract: plain ESM, no JSX (`h` is React.createElement), no hex colors (theme tones
  * only), every row padded to a fixed width so the card never resizes while ticking, and a
- * missing file renders the same card with zeroed values.
+ * missing file keeps the last good snapshot on screen (the title then shows its age).
  */
 
 const WIDTH = 36
@@ -38,13 +41,22 @@ const COST_W = 8
 const PCT_W = 5
 const DEFAULT_CONTEXT_WINDOW = 1000000
 const POLL_MS = 500
+/** A snapshot this old is shown with its age in the title, so stale numbers never look live. */
+const STALE_S = 120
 
 const EMPTY = {
+  burn_source: 'none',
+  burn_usd_per_hour: 0,
   cache_hit_pct: 0,
+  cache_saved_source: 'none',
+  cache_saved_usd: 0,
   context_tokens: 0,
   context_window: DEFAULT_CONTEXT_WINDOW,
   cost_source: 'none',
   cost_usd: 0,
+  day_cost_usd: 0,
+  day_sessions: 0,
+  day_source: 'none',
   delegates: { cost_source: 'none', cost_usd: 0, count: 0 },
   input_tokens: 0,
   model: '',
@@ -52,7 +64,8 @@ const EMPTY = {
   primary_session: '',
   total_cost_usd: 0,
   turn: 0,
-  turns: []
+  turns: [],
+  ts: 0
 }
 
 const COST_SOURCES = new Set(['provider', 'table', 'none'])
@@ -105,6 +118,48 @@ export function formatAgents(delegates) {
   return body.padStart(VALUE_W)
 }
 
+/** Burn row: dollars per hour, 2 decimals, always 22 cells. `~` = estimated from tokens,
+ *   `$n/a/h` when the session has no priced cost yet:
+ *   `            ~$0.55/h`   `              $n/a/h` */
+export function formatBurn(value, source) {
+  if (source !== 'provider' && source !== 'table') {
+    return '$n/a/h'.padStart(VALUE_W)
+  }
+
+  const body = `$${Math.max(0, num(value)).toFixed(2)}/h`
+
+  return (source === 'table' ? `~${body}` : ` ${body}`).padStart(VALUE_W)
+}
+
+/** Saved row: dollars the cache avoided, 4 decimals like the cost row. */
+export function formatSaved(value, source) {
+  if (source !== 'provider' && source !== 'table') {
+    return '$n/a'.padStart(VALUE_W)
+  }
+
+  const body = `$${Math.max(0, num(value)).toFixed(4)}`
+
+  return (source === 'table' ? `~${body}` : ` ${body}`).padStart(VALUE_W)
+}
+
+/** Today row: every session in the window, as cost plus chat count. Fixed 22 cells:
+ *   `      ~$2.1871  25 chats`   `                      none` */
+export function formatToday(value, source, sessions) {
+  const count = Math.max(0, Math.floor(num(sessions)))
+
+  if (!count) {
+    return 'none'.padStart(VALUE_W)
+  }
+
+  if (source !== 'provider' && source !== 'table') {
+    return `${String(count)} chats`.padStart(VALUE_W)
+  }
+  const cost = formatCost(value, source).trimStart()
+  const tail = `${count} chat${count === 1 ? '' : 's'}`
+
+  return `${cost}  ${tail}`.padStart(VALUE_W)
+}
+
 /** Coerce one parsed JSON object into the shape the rows expect. Never throws. */
 function normalize(raw) {
   if (!raw || typeof raw !== 'object') {
@@ -122,11 +177,18 @@ function normalize(raw) {
   const window = Math.floor(num(raw.context_window, DEFAULT_CONTEXT_WINDOW))
 
   return {
+    burn_source: sourceField(raw.burn_source, costSourceOf(raw)),
+    burn_usd_per_hour: Math.max(0, num(raw.burn_usd_per_hour)),
     cache_hit_pct: Math.min(100, Math.max(0, num(raw.cache_hit_pct))),
+    cache_saved_source: sourceField(raw.cache_saved_source, 'none'),
+    cache_saved_usd: Math.max(0, num(raw.cache_saved_usd)),
     context_tokens: Math.max(0, num(raw.context_tokens)),
     context_window: window > 0 ? window : DEFAULT_CONTEXT_WINDOW,
     cost_source: costSourceOf(raw),
     cost_usd: Math.max(0, num(raw.cost_usd)),
+    day_cost_usd: Math.max(0, num(raw.day_cost_usd)),
+    day_sessions: Math.max(0, Math.floor(num(raw.day_sessions))),
+    day_source: sourceField(raw.day_source, 'none'),
     delegates: {
       cost_source: sourceField(rawDelegates.cost_source, 'none'),
       cost_usd: Math.max(0, num(rawDelegates.cost_usd)),
@@ -138,12 +200,15 @@ function normalize(raw) {
     primary_session: typeof raw.primary_session === 'string' ? raw.primary_session : '',
     total_cost_usd: Math.max(0, num(raw.total_cost_usd, num(raw.cost_usd))),
     turn: Math.max(0, num(raw.turn)),
-    turns
+    turns,
+    ts: Math.max(0, num(raw.ts))
   }
 }
 
 /** Compact token counts with a fixed ceiling of 6 cells (`999.9k`, `1.2M`). */
 function fmt(n) {
+  n = num(n)
+
   if (n >= 1e6) {
     return `${(n / 1e6).toFixed(1)}M`
   }
@@ -162,26 +227,84 @@ function shortModel(model) {
   return body.padEnd(VALUE_W)
 }
 
-/** Read the snapshot file. Missing or malformed file = cold start, never a throw.
- *  Exported as a test seam: the smoke test calls it without a TUI. */
+/** Read the snapshot file. Returns ``null`` when the file is missing, unreadable, not JSON,
+ *  or not a JSON object.
+ *
+ *  ``null`` is the honest answer for "no fresh data": the caller then keeps the last good
+ *  snapshot on screen, so a write in flight, a rolled log or a corrupt byte cannot blank
+ *  the card for a tick. Exported as a test seam: the smoke test calls it without a TUI. */
 export async function readSnapshot() {
   try {
     const [fsp, os] = await Promise.all([import('node:fs/promises'), import('node:os')])
     const home = (process.env.HERMES_HOME || '').trim() || `${os.homedir()}/.hermes`
     const raw = await fsp.readFile(`${home}/state/savvy-progress.json`, 'utf8')
+    const parsed = JSON.parse(raw)
 
-    return normalize(JSON.parse(raw))
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null
+    }
+
+    return normalize(parsed)
   } catch {
-    return { ...EMPTY }
+    return null
   }
 }
 
-export default function register(sdk) {
-  const { Box, Dialog, React, Text, defineWidgetApp, gauge, h } = sdk
+/** Keep the last good snapshot when a poll comes back empty. Pure, so the test can drive
+ *  it: ``mergeSnapshot(prev, null)`` returns ``prev`` unchanged. */
+export function mergeSnapshot(prev, next) {
+  if (!next || typeof next !== 'object' || Array.isArray(next)) {
+    return prev
+  }
+
+  return normalize(next)
+}
+
+/** Age of a snapshot in words: `40s`, `12m`, `3h`, `2d`. */
+export function formatAge(seconds) {
+  const s = Math.max(0, num(seconds))
+
+  if (s < 90) {
+    return `${Math.round(s)}s`
+  }
+
+  if (s < 5400) {
+    return `${Math.round(s / 60)}m`
+  }
+
+  if (s < 172800) {
+    return `${Math.round(s / 3600)}h`
+  }
+
+  return `${Math.round(s / 86400)}d`
+}
+
+/** Suffix for the card title when the snapshot is no longer fresh: `· 4m`, else ''. */
+export function staleLabel(ts, nowSeconds) {
+  const t = num(ts)
+
+  if (t <= 0) {
+    return ''
+  }
+
+  const age = num(nowSeconds) - t
+
+  if (age < STALE_S) {
+    return ''
+  }
+
+  return ` · ${formatAge(age)}`
+}
+
+/** Build the card rows from a normalized snapshot. Exported as a test seam: the smoke
+ *  test walks the returned tree and checks every row is exactly ROW_W cells wide.
+ *  `parts` carries the renderer primitives (`Box`, `Text`, `gauge`, `h`). */
+export function buildRows(parts, snap, t) {
+  const { Box, Text, gauge, h } = parts
 
   /** One card row: fixed label column plus a fixed 22-cell value field.
    *  `align` is 'end' for numbers and 'start' for text, so nothing shifts between ticks. */
-  function row(key, label, value, tone, t, align = 'end') {
+  const row = (key, label, value, tone, align = 'end') => {
     const body = String(value ?? '')
     const cell = (body.length > VALUE_W ? `${body.slice(0, VALUE_W - 1)}…` : body)
     const pad = align === 'start' ? cell.padEnd(VALUE_W) : cell.padStart(VALUE_W)
@@ -193,6 +316,37 @@ export default function register(sdk) {
       h(Text, { color: tone }, pad)
     )
   }
+
+  const hit = Math.min(100, Math.max(0, num(snap.cache_hit_pct)))
+  const hitTone = hit >= 70 ? t.color.ok : hit >= 30 ? t.color.warn : t.color.error
+  const window = Math.max(0, num(snap.context_window))
+  const ctxRatio = window > 0
+    ? Math.min(1, Math.max(0, num(snap.context_tokens) / window))
+    : 0
+  const ctxTone = ctxRatio >= 0.9 ? t.color.error : ctxRatio >= 0.7 ? t.color.warn : t.color.text
+
+  /* Fixed-cell fields: 12-cell gauge plus a 5-cell percent on both gauge rows. */
+  const gaugeText = String(gauge(hit / 100, GAUGE_W)).slice(0, GAUGE_W).padEnd(GAUGE_W)
+  const pctText = `${hit.toFixed(1)}%`.padStart(PCT_W)
+  const ctxGauge = String(gauge(ctxRatio, GAUGE_W)).slice(0, GAUGE_W).padEnd(GAUGE_W)
+  const ctxPct = `${(ctxRatio * 100).toFixed(1)}%`.padStart(PCT_W)
+  const hasAgents = snap.delegates.count > 0
+
+  return [
+    row('model', 'model', shortModel(snap.model), t.color.text, 'start'),
+    row('tokens', 'tokens', `${fmt(snap.input_tokens)} / ${fmt(snap.output_tokens)}`, t.color.text),
+    row('cache', 'cache', `${gaugeText} ${pctText}`, hitTone),
+    row('ctx', 'ctx', `${ctxGauge} ${ctxPct}`, ctxTone),
+    row('cost', 'cost', formatCost(snap.total_cost_usd, snap.cost_source), t.color.accent),
+    row('burn', 'burn', formatBurn(snap.burn_usd_per_hour, snap.burn_source), t.color.text),
+    row('saved', 'saved', formatSaved(snap.cache_saved_usd, snap.cache_saved_source), t.color.ok),
+    row('today', 'today', formatToday(snap.day_cost_usd, snap.day_source, snap.day_sessions), t.color.accent),
+    row('agents', 'agents', formatAgents(snap.delegates), hasAgents ? t.color.text : t.color.muted)
+  ]
+}
+
+export default function register(sdk) {
+  const { Box, Dialog, React, Text, defineWidgetApp, gauge, h } = sdk
 
   /** `snapshot` is an optional seed: production passes only `t` and the card polls;
    *  the smoke test seeds one to exercise the populated layout without a TUI. */
@@ -213,8 +367,8 @@ export default function register(sdk) {
         try {
           const next = await readSnapshot()
 
-          if (alive) {
-            setSnap(next)
+          if (alive && next) {
+            setSnap(current => mergeSnapshot(current, next))
           }
         } catch {
           // readSnapshot never throws; a broken repaint must not kill the interval.
@@ -235,29 +389,14 @@ export default function register(sdk) {
       }
     }, [])
 
-    const hit = snap.cache_hit_pct
-    const hitTone = hit >= 70 ? t.color.ok : hit >= 30 ? t.color.warn : t.color.error
-    const ctxRatio = snap.context_window > 0
-      ? Math.min(1, Math.max(0, snap.context_tokens / snap.context_window))
-      : 0
-    const ctxTone = ctxRatio >= 0.9 ? t.color.error : ctxRatio >= 0.7 ? t.color.warn : t.color.text
-
-    /* Fixed-cell fields: 12-cell gauge plus a 5-cell percent on both gauge rows. */
-    const gaugeText = String(gauge(hit / 100, GAUGE_W)).slice(0, GAUGE_W).padEnd(GAUGE_W)
-    const pctText = `${hit.toFixed(1)}%`.padStart(PCT_W)
-    const ctxGauge = String(gauge(ctxRatio, GAUGE_W)).slice(0, GAUGE_W).padEnd(GAUGE_W)
-    const ctxPct = `${(ctxRatio * 100).toFixed(1)}%`.padStart(PCT_W)
-    const hasAgents = snap.delegates.count > 0
-
     return h(
-      Box,
-      { flexDirection: 'column', width: ROW_W },
-      row('model', 'model', shortModel(snap.model), t.color.text, t, 'start'),
-      row('tokens', 'tokens', `${fmt(snap.input_tokens)} / ${fmt(snap.output_tokens)}`, t.color.text, t),
-      row('cache', 'cache', `${gaugeText} ${pctText}`, hitTone, t),
-      row('ctx', 'ctx', `${ctxGauge} ${ctxPct}`, ctxTone, t),
-      row('cost', 'cost', formatCost(snap.total_cost_usd, snap.cost_source), t.color.accent, t),
-      row('agents', 'agents', formatAgents(snap.delegates), hasAgents ? t.color.text : t.color.muted, t)
+      Dialog,
+      { title: `PROGRESS${staleLabel(snap.ts, Date.now() / 1000)}`, width: WIDTH },
+      h(
+        Box,
+        { flexDirection: 'column', width: ROW_W },
+        ...buildRows({ Box, Text, gauge, h }, snap, t)
+      )
     )
   }
 
@@ -278,7 +417,8 @@ export default function register(sdk) {
     },
 
     render({ t }) {
-      return h(Dialog, { title: 'PROGRESS', width: WIDTH }, h(Card, { t }))
+      // The card owns the Dialog so the title can show snapshot age.
+      return h(Card, { t })
     }
   })
 

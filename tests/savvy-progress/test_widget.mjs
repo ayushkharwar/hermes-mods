@@ -1,361 +1,252 @@
 /**
- * savvy-progress widget smoke test. No TUI, no React install: a mock SDK captures the app
- * definition and renders the card with a fake theme, then the rows are counted and printed.
+ * Stress test: savvy-progress TUI widget (burn / saved / today rows).
  *
- * Run: node tests/savvy-progress/test_widget.mjs
+ * Imports the real widget module, builds the row tree with a fake renderer, and asserts
+ * every row is exactly ROW_W cells wide in every snapshot shape: full, legacy, all-none,
+ * overflow, garbage, and file-level cases (missing, malformed, one chat).
+ * Run: node test_widget.mjs
  */
+import { buildRows, formatCost, formatBurn, formatSaved, formatToday, formatAgents, readSnapshot, mergeSnapshot, formatAge, staleLabel } from '../../tui-widgets/savvy-progress.mjs'
+import register from '../../tui-widgets/savvy-progress.mjs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
-const FILE = new URL('../../tui-widgets/savvy-progress.mjs', import.meta.url).href
+const LABEL_W = 8
+const VALUE_W = 22
+const ROW_W = LABEL_W + VALUE_W
 
-const fakeTheme = {
-  color: {
-    accent: '#fff',
-    border: '#fff',
-    error: '#fff',
-    label: '#fff',
-    muted: '#fff',
-    ok: '#fff',
-    primary: '#fff',
-    text: '#fff',
-    warn: '#fff'
+let checks = 0
+const fails = []
+
+function check(name, cond, detail = '') {
+  checks += 1
+  if (!cond) {
+    fails.push(`${name}${detail ? ' :: ' + detail : ''}`)
+    console.log(`FAIL  ${name}  ${detail}`)
+  } else {
+    console.log(`ok    ${name}`)
   }
 }
 
-const captured = []
-const opened = []
-const h = (type, props, ...children) => ({ type, props: props || {}, children: children.flat() })
+const t = {
+  color: { ok: 'ok', warn: 'warn', error: 'error', muted: 'muted', text: 'text', accent: 'accent' }
+}
+const h = (type, props, ...kids) => ({ type, props, kids })
+const gauge = (ratio, width) => {
+  const filled = Math.round(Math.min(1, Math.max(0, ratio)) * width)
+  return '█'.repeat(filled) + '░'.repeat(width - filled)
+}
+const parts = { Box: 'Box', Text: 'Text', gauge, h }
 
-const mockReact = {
-  useState: init => [typeof init === 'function' ? init() : init, () => {}],
-  useEffect: () => {},
-  useRef: value => ({ current: value })
+const textOf = node => node == null ? '' : typeof node === 'string' ? node : (node.kids || []).map(textOf).join('')
+
+function rowsOf(snapshot) {
+  return buildRows(parts, snapshot, t)
 }
 
-const mockSdk = {
-  Accordion: 'Accordion',
-  Box: 'Box',
-  Dialog: 'Dialog',
-  GridAreas: 'GridAreas',
-  Overlay: 'Overlay',
-  React: mockReact,
-  Shimmer: 'Shimmer',
-  ShimmerRows: 'ShimmerRows',
-  Text: 'Text',
-  WidgetGrid: 'WidgetGrid',
-  defineWidgetApp: app => {
-    captured.push(app)
-
-    return app
-  },
-  gauge: (ratio, width) => {
-    const filled = Math.round(Math.min(1, Math.max(0, ratio)) * width)
-
-    return '█'.repeat(filled) + '░'.repeat(Math.max(0, width - filled))
-  },
-  h,
-  hbars: (values, width) => values.map(() => '█'.repeat(width)),
-  isCtrl: () => false,
-  openWidget: (app, state) => {
-    opened.push({ id: app && app.id, state })
-  },
-  sparkRows: (series, width, rows) => Array.from({ length: rows }, () => '▄'.repeat(width)),
-  sparkline: (series, width = series.length) => {
-    const blocks = '▁▂▃▄▅▆▇█'
-    if (!series.length) {
-      return ' '.repeat(Math.max(0, width))
-    }
-    const view = series.slice(-width)
-    const min = Math.min(...view)
-    const range = Math.max(...view) - min || 1
-
-    return view
-      .map(v => blocks[Math.min(7, Math.floor(((v - min) / range) * 8))])
-      .join('')
-      .padStart(width)
-  },
-  updateWidget: () => {},
-  useShimmerPhase: () => 0
-}
-
-const failures = []
-const check = (name, ok, detail = '') => {
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  ${detail}` : ''}`)
-  if (!ok) {
-    failures.push(name)
+function assertRows(name, snapshot, expectations = {}) {
+  const rows = rowsOf(snapshot)
+  check(`${name}: row count`, rows.length === 9, String(rows.length))
+  for (const row of rows) {
+    const key = row.props?.key
+    const text = textOf(row)
+    const width = [...text].length
+    check(`${name}: ${key} width ${ROW_W}`, width === ROW_W, `got ${width} (${JSON.stringify(text)})`)
+    check(`${name}: ${key} props width`, row.props?.width === ROW_W, String(row.props?.width))
   }
+  const byKey = Object.fromEntries(rows.map(r => [r.props.key, textOf(r).slice(LABEL_W)]))
+  for (const [key, expected] of Object.entries(expectations)) {
+    check(`${name}: ${key} shows ${JSON.stringify(expected)}`, byKey[key] === expected, JSON.stringify(byKey[key]))
+  }
+  return byKey
 }
 
-const mod = await import(`${FILE}?t=${Date.now()}`)
-check('default export is a function', typeof mod.default === 'function')
-check('formatCost is exported for the cost-source test', typeof mod.formatCost === 'function')
-check('formatAgents is exported for the delegate row test', typeof mod.formatAgents === 'function')
-
-/* Agents row: same 22 cells with and without delegates. */
-const agentsSome = mod.formatAgents({ count: 3, cost_usd: 0.0412, cost_source: 'table' })
-const agentsNone = mod.formatAgents({ count: 0, cost_usd: 0, cost_source: 'none' })
-check('formatAgents keeps a 22-cell field in both cases',
-  agentsSome.length === 22 && agentsNone.length === 22, JSON.stringify([agentsSome, agentsNone]))
-check('agents row shows the count and the added cost',
-  agentsSome.trim() === '3   +~$0.0412', JSON.stringify(agentsSome))
-check('agents row reads none without delegates', agentsNone.trim() === 'none', JSON.stringify(agentsNone))
-
-/* Cost field: same width for all three sources, so the card never resizes. */
-const costViews = ['provider', 'table', 'none'].map(source => mod.formatCost(0.0123, source))
-check('formatCost returns an 8-cell field for every source',
-  costViews.every(v => v.length === 8), JSON.stringify(costViews))
-check('provider cost is a plain $ value', costViews[0].trim() === '$0.0123', JSON.stringify(costViews[0]))
-check('table cost is marked as an estimate', costViews[1].trim() === '~$0.0123', JSON.stringify(costViews[1]))
-check('none cost is n/a, not $0.0000', costViews[2].trim() === '$n/a', JSON.stringify(costViews[2]))
-
-mod.default(mockSdk)
-check('defineWidgetApp called once', captured.length === 1, `captured=${captured.length}`)
-
-const app = captured[0]
-check('app id is progress', app.id === 'progress', `id=${app.id}`)
-check('app is ambient', app.mode === 'ambient', `mode=${app.mode}`)
-check('app zone is top-right', app.zone === 'top-right', `zone=${app.zone}`)
-check('app width is 36', app.width === 36, `width=${app.width}`)
-
-check('auto-docked on load', opened.length === 1, `opened=${opened.length}`)
-check('auto-dock used the progress app', (opened[0] || {}).id === 'progress', JSON.stringify(opened[0]))
-check('auto-dock passed an init state', Boolean(opened[0] && opened[0].state), JSON.stringify((opened[0] || {}).state))
-
-const state = app.init('')
-check('init("") returns an object', state !== null && typeof state === 'object', JSON.stringify(state))
-
-/* Render, then expand one level of function components so the card becomes inspectable. */
-const tree = app.render({ cols: 120, rows: 40, state, t: fakeTheme })
-check('render returns an element tree', !!tree && typeof tree === 'object' && 'type' in tree)
-
-const expand = node => {
-  if (Array.isArray(node)) {
-    return node.map(expand)
-  }
-
-  if (!node || typeof node !== 'object') {
-    return node
-  }
-
-  const { type, props, children } = node
-  const kids = (children || []).map(expand)
-
-  if (typeof type === 'function') {
-    const rendered = type({ ...props, children: kids })
-
-    return expand(rendered)
-  }
-
-  return { ...node, children: kids }
-}
-
-const dialog = expand(tree)
-check('dialog receives an explicit width', typeof dialog.props.width === 'number', `width=${dialog.props.width}`)
-check('dialog title is PROGRESS', dialog.props.title === 'PROGRESS', `title=${dialog.props.title}`)
-
-const card = dialog.children[0]
-const rows = card.children
-const rowText = node =>
-  (node.children || [])
-    .map(child => (typeof child === 'string' ? child : rowText(child)))
-    .join('')
-
-/* count text rows: title + card rows */
-const textRows = rows.length + 1
-check('at most 6 card rows', rows.length <= 6, `rows=${rows.length}`)
-check('every row is 30 cells', rows.every(r => rowText(r).length === 30), rows.map(r => rowText(r).length).join(','))
-
-console.log('\n--- cold-start card (file not read; state is zeroed) ---')
-console.log(`| ${dialog.props.title.padEnd(30)} |`)
-for (const row of rows) {
-  console.log(`| ${rowText(row)} |`)
-}
-
-/* Populated card: seed the Card with a synthetic snapshot to exercise a live layout. */
-const cardType = tree.children[0].type
-const seedBase = {
-  cache_hit_pct: 80,
-  context_tokens: 34200,
+const normal = {
+  model: 'deepseek-ai/deepseek-v4.1-flash-1017',
+  input_tokens: 35969,
+  output_tokens: 4072,
+  cache_hit_pct: 91.7,
+  context_tokens: 28802,
   context_window: 1000000,
   cost_source: 'table',
-  cost_usd: 0.0123,
-  input_tokens: 123456,
-  model: 'custom/deepseek-v4.1-flash',
-  output_tokens: 4321,
-  primary_session: 'local-50ccc51cc86cf3e727fc505bdff80e08949c5ef08c19fac196a355f196412e7d',
-  total_cost_usd: 0.0535,
-  turn: 7,
-  turns: [0.001, 0.0008, 0.0021, 0.0005, 0.0014, 0.0009, 0.0033, 0.0011, 0.0026, 0.0007].map(cost => ({ cost }))
-}
-const withDelegates = { ...seedBase, delegates: { count: 3, cost_usd: 0.0412, cost_source: 'table' } }
-const withoutDelegates = {
-  ...seedBase,
-  total_cost_usd: 0.0123,
+  total_cost_usd: 0.018062,
+  burn_usd_per_hour: 0.55,
+  burn_source: 'table',
+  cache_saved_usd: 0.147,
+  cache_saved_source: 'table',
+  day_cost_usd: 2.1871,
+  day_source: 'table',
+  day_sessions: 25,
   delegates: { count: 0, cost_usd: 0, cost_source: 'none' }
 }
 
-const renderRows = snapshot => expand(cardType({ t: fakeTheme, snapshot })).children.map(rowText)
-const seededTree = expand(cardType({ t: fakeTheme, snapshot: withDelegates }))
-const seeded = seededTree.children.map(rowText)
-const seededNone = renderRows(withoutDelegates)
-
-check('populated card keeps every row at 30 cells',
-  seeded.every(r => r.length === 30) && seededNone.every(r => r.length === 30),
-  `${seeded.map(r => r.length).join(',')} | ${seededNone.map(r => r.length).join(',')}`)
-check('populated card has exactly 6 rows', seeded.length === 6 && seededNone.length === 6,
-  `rows=${seeded.length}/${seededNone.length}`)
-check('populated card shows the short model', seeded[0].includes('deepseek-v4.1-flash'), seeded[0].trim())
-check('cost row shows the total, not the primary share',
-  seeded[4].slice(-8) === '~$0.0535', JSON.stringify(seeded[4].slice(-8)))
-check('agents row shows the delegate count and the added cost',
-  seeded[5].slice(8) === mod.formatAgents(withDelegates.delegates), JSON.stringify(seeded[5].slice(8)))
-check('agents row reads none when no delegate ran',
-  seededNone[5].slice(8).trim() === 'none' && seededNone[4].slice(-8) === '~$0.0123',
-  JSON.stringify(seededNone[5].slice(8)))
-
-/* Cosmetics: fixed label column, numbers right-aligned, both gauge rows identical in shape. */
-const labels = seededTree.children.map(node => rowText(node.children[0]).trim())
-check('labels are model/tokens/cache/ctx/cost/agents',
-  labels.join(',') === 'model,tokens,cache,ctx,cost,agents', labels.join(','))
-check('tokens row is right-aligned in its 22-cell field',
-  seeded[1].endsWith(`${'123.5k / 4.3k'.padStart(22)}`), JSON.stringify(seeded[1]))
-check('model row is left-aligned in its 22-cell field',
-  seeded[0].slice(8) === 'deepseek-v4.1-flash'.padEnd(22), JSON.stringify(seeded[0].slice(8)))
-const cacheValue = seeded[2].slice(8)
-check('cache row is a 12-cell gauge plus a 5-cell percent',
-  cacheValue.length === 22 && cacheValue.trim().length === 18 && cacheValue.endsWith('80.0%'),
-  JSON.stringify(cacheValue))
-const ctxValue = seeded[3].slice(8)
-check('ctx row is a 12-cell gauge plus a 5-cell percent',
-  ctxValue.length === 22 && ctxValue.trim().length === 18 && ctxValue.endsWith('3.4%'),
-  JSON.stringify(ctxValue))
-check('ctx gauge fills in proportion to context_tokens / context_window',
-  ctxValue.trimStart().slice(0, 12) === '░░░░░░░░░░░░' && ctxValue.trimStart().slice(12) === '  3.4%',
-  JSON.stringify(ctxValue))
-
-console.log('\n--- mock card: delegates present ---')
-console.log(`| ${dialog.props.title.padEnd(30)} |`)
-for (const row of seeded) {
-  console.log(`| ${row} |`)
-}
-
-console.log('\n--- mock card: no delegates ---')
-console.log(`| ${dialog.props.title.padEnd(30)} |`)
-for (const row of seededNone) {
-  console.log(`| ${row} |`)
-}
-
-/* A brand-new chat: its own zeros, never the previous chat's numbers. */
-const zeroPrimary = {
-  cache_hit_pct: 0,
-  context_tokens: 0,
-  context_window: 1000000,
-  cost_source: 'none',
-  cost_usd: 0,
-  delegates: { count: 0, cost_source: 'none', cost_usd: 0 },
-  input_tokens: 0,
-  model: 'deepseek-v4.1-flash',
-  output_tokens: 0,
-  primary_session: 'local-bbbb2222-new-chat',
-  total_cost_usd: 0,
-  turn: 0,
-  turns: []
-}
-const zeroRows = renderRows(zeroPrimary)
-check('zero-usage primary keeps six 30-cell rows',
-  zeroRows.length === 6 && zeroRows.every(r => r.length === 30),
-  zeroRows.map(r => r.length).join(','))
-check('zero-usage primary shows 0 / 0 tokens',
-  zeroRows[1].slice(8).trim() === '0 / 0', JSON.stringify(zeroRows[1].slice(8).trim()))
-check('zero-usage primary shows an empty cache gauge at 0.0%',
-  zeroRows[2].endsWith('  0.0%') && zeroRows[2].slice(8).trimStart().startsWith('░'),
-  JSON.stringify(zeroRows[2].slice(8)))
-check('zero-usage primary shows $n/a, not a stale dollar amount',
-  zeroRows[4].slice(-8) === '    $n/a', JSON.stringify(zeroRows[4].slice(-8)))
-check('zero-usage primary has no agents row value', zeroRows[5].slice(8).trim() === 'none')
-
-console.log('\n--- mock card: zero-usage primary (new chat) ---')
-console.log(`| ${dialog.props.title.padEnd(30)} |`)
-for (const row of zeroRows) {
-  console.log(`| ${row} |`)
-}
-
-/* All three cost sources, same seed otherwise: the card must not resize. */
-const seededFor = source => renderRows({
-  ...seedBase,
-  cost_source: source,
-  delegates: { count: 2, cost_usd: 0.0412, cost_source: source }
+// 1. normal
+const r1 = assertRows('normal', normal, {
+  burn: formatBurn(0.55, 'table'),
+  saved: formatSaved(0.147, 'table'),
+  today: formatToday(2.1871, 'table', 25)
 })
+check('normal: burn reads ~$0.55/h', r1.burn.includes('~$0.55/h'), JSON.stringify(r1.burn))
+check('normal: today reads 25 chats', r1.today.includes('25 chats'), JSON.stringify(r1.today))
 
-const tableRows = seededFor('table')
-const providerRows = seededFor('provider')
-const noneRows = seededFor('none')
+// 2. legacy snapshot with no new keys at all
+const legacy = { model: 'deepseek-v4.1-flash', input_tokens: 1, output_tokens: 1, cache_hit_pct: 50, context_tokens: 1, context_window: 1000000, cost_source: 'provider', total_cost_usd: 0.01, delegates: { count: 0 } }
+const r2 = assertRows('legacy', legacy)
+check('legacy: burn unnormalized reads n/a', r2.burn.includes('$n/a/h'), JSON.stringify(r2.burn))
+check('legacy: saved reads n/a', r2.saved.includes('$n/a'), JSON.stringify(r2.saved))
+check('legacy: today reads none', r2.today.trim() === 'none', JSON.stringify(r2.today))
 
-check('cost_source=table prefixes the number with ~', tableRows[4].slice(-8) === '~$0.0535',
-  JSON.stringify(tableRows[4].slice(-8)))
-check('cost_source=provider shows a plain $ value', providerRows[4].slice(-8) === ' $0.0535',
-  JSON.stringify(providerRows[4].slice(-8)))
-check('cost_source=none shows $n/a', noneRows[4].slice(-8) === '    $n/a',
-  JSON.stringify(noneRows[4].slice(-8)))
-check('every source keeps all six rows at 30 cells',
-  [tableRows, providerRows, noneRows].every(rows => rows.length === 6 && rows.every(r => r.length === 30)),
-  [tableRows, providerRows, noneRows].map(rows => rows.map(r => r.length).join(',')).join(' | '))
-check('the cost cell is 8 cells wide in all three cases',
-  new Set([tableRows, providerRows, noneRows].map(rows => rows[4].slice(-8).length)).size === 1 &&
-    [tableRows, providerRows, noneRows].every(rows => rows[4].length === 30))
+// 3. every source none
+const r3 = assertRows('all-none', { ...normal, cost_source: 'none', total_cost_usd: 0, burn_source: 'none', burn_usd_per_hour: 0, cache_saved_source: 'none', cache_saved_usd: 0, day_source: 'none', day_cost_usd: 0, day_sessions: 0 })
+check('all-none: burn n/a/h', r3.burn.includes('$n/a/h'), JSON.stringify(r3.burn))
+check('all-none: saved n/a', r3.saved.includes('$n/a'), JSON.stringify(r3.saved))
+check('all-none: today none', r3.today.trim() === 'none', JSON.stringify(r3.today))
 
-console.log('\n--- cost row, all three sources ---')
-for (const [source, rows] of [['provider', providerRows], ['table', tableRows], ['none', noneRows]]) {
-  console.log(`${source.padEnd(9)} | ${rows[4]} |`)
+// 4. overflow values must truncate, never push the row wide
+const r4 = assertRows('overflow', { ...normal, total_cost_usd: 12345678.9, burn_usd_per_hour: 999999.99, cache_saved_usd: 1234567.891, day_cost_usd: 98765.4321, day_sessions: 54321 })
+check('overflow: truncation marker present', r4.burn.includes('…') || r4.saved.includes('…') || r4.today.includes('…'), JSON.stringify(r4))
+
+// 5. garbage / hostile values
+const r5 = assertRows('garbage', { ...normal, burn_usd_per_hour: 'lol', burn_source: 'weird', cache_saved_usd: null, cache_saved_source: 123, day_cost_usd: -5, day_source: 'TABLE', day_sessions: 'x', delegates: { count: 'x', cost_usd: null, cost_source: 7 } })
+check('garbage: burn n/a/h after bad source', r5.burn.includes('$n/a/h'), JSON.stringify(r5.burn))
+check('garbage: today none after bad count', r5.today.trim() === 'none', JSON.stringify(r5.today))
+
+// 6. singular chat label and provider cost
+const r6 = assertRows('one-chat', { ...normal, day_cost_usd: 0.5, day_source: 'provider', day_sessions: 1 })
+check('one-chat: singular label', r6.today.includes('1 chat') && !r6.today.includes('1 chats'), JSON.stringify(r6.today))
+check('one-chat: provider plain dollar', !r6.today.includes('~'), JSON.stringify(r6.today))
+
+// 7. delegates plus burn together
+const r7 = assertRows('delegates', { ...normal, delegates: { count: 3, cost_usd: 0.0412, cost_source: 'table' } })
+check('delegates: agents row shows count', r7.agents.includes('3'), JSON.stringify(r7.agents))
+
+// 8. huge token counts and full context
+const r8 = assertRows('huge-tokens', { ...normal, input_tokens: 123456789, output_tokens: 987654321, context_tokens: 1000000, context_window: 1000000 })
+check('huge-tokens: context gauge pinned at 100.0%', r8.ctx.includes('100.0%'), JSON.stringify(r8.ctx))
+
+// 9. formatter contracts
+check('formatBurn none', formatBurn(1, 'none') === '$n/a/h'.padStart(VALUE_W))
+check('formatBurn table', formatBurn(0.5543, 'table') === '~$0.55/h'.padStart(VALUE_W))
+check('formatBurn provider', formatBurn(0.5543, 'provider') === ' $0.55/h'.padStart(VALUE_W))
+check('formatSaved none', formatSaved(1, 'none') === '$n/a'.padStart(VALUE_W))
+check('formatSaved table', formatSaved(0.147, 'table') === '~$0.1470'.padStart(VALUE_W))
+check('formatToday none', formatToday(1, 'table', 0) === 'none'.padStart(VALUE_W))
+check('formatToday one', formatToday(0.5, 'provider', 1) === ' $0.5000  1 chat'.padStart(VALUE_W), JSON.stringify(formatToday(0.5, 'provider', 1)))
+check('formatCost still 8 cells', formatCost(0.0123, 'table').length === 8)
+check('formatAgents none width', formatAgents({ count: 0 }).length === VALUE_W)
+
+// 10. file-level: missing file, malformed JSON, populated file
+const home = mkdtempSync(join(tmpdir(), 'savvy-widget-'))
+process.env.HERMES_HOME = home
+
+let snap = await readSnapshot()
+check('missing file: null, not a fake card', snap === null, JSON.stringify(snap).slice(0, 80))
+
+mkdirSync(join(home, 'state'), { recursive: true })
+writeFileSync(join(home, 'state/savvy-progress.json'), '{not json')
+snap = await readSnapshot()
+check('malformed json: null', snap === null, JSON.stringify(snap).slice(0, 80))
+
+writeFileSync(join(home, 'state/savvy-progress.json'), JSON.stringify({ ...normal, day_sessions: 3 }))
+snap = await readSnapshot()
+check('populated file: parsed', snap.day_sessions === 3 && Math.abs(snap.burn_usd_per_hour - 0.55) < 1e-9, JSON.stringify({ d: snap.day_sessions, b: snap.burn_usd_per_hour }))
+assertRows('file-snapshot', snap)
+
+writeFileSync(join(home, 'state/savvy-progress.json'), JSON.stringify([1, 2, 3]))
+snap = await readSnapshot()
+check('json array: null', snap === null, JSON.stringify(snap).slice(0, 80))
+
+// 11. legacy file through readSnapshot: burn inherits the cost source, saved stays n/a
+writeFileSync(join(home, 'state/savvy-progress.json'), JSON.stringify(legacy))
+snap = await readSnapshot()
+check('legacy file: burn_source inherits provider', snap.burn_source === 'provider', snap.burn_source)
+check('legacy file: burn renders plain dollar', formatBurn(snap.burn_usd_per_hour, snap.burn_source) === ' $0.00/h'.padStart(VALUE_W), JSON.stringify(formatBurn(snap.burn_usd_per_hour, snap.burn_source)))
+check('legacy file: saved stays n/a', snap.cache_saved_source === 'none', snap.cache_saved_source)
+assertRows('legacy-file', snap)
+
+rmSync(home, { recursive: true, force: true })
+
+// 12. NaN / Infinity inside a parsed snapshot must never print "NaN"
+const r12 = assertRows('nan-values', { ...normal, burn_usd_per_hour: Number.NaN, cache_saved_usd: Number.POSITIVE_INFINITY, day_cost_usd: Number.NEGATIVE_INFINITY, day_sessions: Number.NaN, total_cost_usd: Number.NaN, cache_hit_pct: Number.NaN, input_tokens: Number.NaN })
+const joined = Object.values(r12).join(' ')
+check('nan-values: no NaN or Infinity text', !/NaN|Infinity/.test(joined), JSON.stringify(joined))
+
+// 13. a JSON file with a bare Infinity literal (invalid JSON) degrades to the cold card
+const home2 = mkdtempSync(join(tmpdir(), 'savvy-widget2-'))
+mkdirSync(join(home2, 'state'), { recursive: true })
+process.env.HERMES_HOME = home2
+writeFileSync(join(home2, 'state/savvy-progress.json'), '{"burn_usd_per_hour": Infinity, "day_sessions": 9}')
+snap = await readSnapshot()
+check('infinity literal: null, no throw', snap === null, JSON.stringify(snap).slice(0, 80))
+check('infinity literal: last good snapshot survives', mergeSnapshot({ day_sessions: 4 }, snap).day_sessions === 4)
+rmSync(home2, { recursive: true, force: true })
+
+// 14. register() against a stub SDK: app contract, and no crash on an older SDK
+let captured = null
+const stubSdk = {
+  Box: 'Box', Dialog: 'Dialog', Text: 'Text',
+  React: { useState: init => [typeof init === 'function' ? init() : init, () => {}], useEffect: () => {} },
+  defineWidgetApp: app => app,
+  gauge,
+  h,
+  openWidget: app => { captured = app }
 }
+let registerError = null
+try {
+  register(stubSdk)
+} catch (err) {
+  registerError = err
+}
+check('register: no throw', registerError === null, String(registerError))
+check('register: docks the widget', captured !== null)
+check('register: app id', captured?.id === 'progress', String(captured?.id))
+check('register: ambient mode', captured?.mode === 'ambient', String(captured?.mode))
+check('register: top-right zone', captured?.zone === 'top-right', String(captured?.zone))
+check('register: width 36', captured?.width === 36, String(captured?.width))
+const el = captured?.render({ t })
+check('register: render returns the card component', Boolean(el) && typeof el.type === 'function', String(el?.type))
+const tree = el ? el.type(el.props) : null
+check('register: card renders a Dialog', Boolean(tree) && tree.type === 'Dialog', String(tree?.type))
+check('register: dialog title PROGRESS', String(tree?.props?.title).startsWith('PROGRESS'), String(tree?.props?.title))
+check('register: dialog width 36', tree?.props?.width === 36, String(tree?.props?.width))
+const inner = tree?.kids?.[0]
+check('register: 9 rows inside', (inner?.kids || []).length === 9, String((inner?.kids || []).length))
 
-/* Live read path: proves the fs/promises dynamic import works from inside the widget module. */
-const live = await mod.readSnapshot()
-check('readSnapshot returns an object', !!live && typeof live === 'object')
-check('readSnapshot has numeric cost_usd', typeof live.cost_usd === 'number', `cost_usd=${live.cost_usd}`)
-console.log('readSnapshot:', JSON.stringify(live))
+let oldSdkError = null
+try {
+  register({ ...stubSdk, openWidget: undefined })
+} catch (err) {
+  oldSdkError = err
+}
+check('register: old SDK without openWidget does not throw', oldSdkError === null, String(oldSdkError))
 
-/* HERMES_HOME-driven read: a temp home with a synthetic file proves the env path and parsing. */
-const fsp = await import('node:fs/promises')
-const os = await import('node:os')
-const tmpHome = await fsp.mkdtemp(`${os.tmpdir()}/savvy-progress-`)
-const previousHome = process.env.HERMES_HOME
-await fsp.mkdir(`${tmpHome}/state`, { recursive: true })
-await fsp.writeFile(
-  `${tmpHome}/state/savvy-progress.json`,
-  JSON.stringify({ model: 'tmp/model-x', cost_usd: 0.5, turn: 3, cache_hit_pct: 42.5, turns: [{ cost: 0.1 }] })
-)
-process.env.HERMES_HOME = tmpHome
-const tilted = await mod.readSnapshot()
-check('readSnapshot follows HERMES_HOME', tilted.model === 'tmp/model-x' && tilted.turn === 3, JSON.stringify(tilted))
-check('a snapshot without cost_source keeps the plain $ form', tilted.cost_source === 'provider',
-  `cost_source=${tilted.cost_source}`)
+// 15. fallbacks: merge keeps the last good card, age labels stay short
+const good = { day_sessions: 7, burn_usd_per_hour: 0.5, ts: 1000 }
+check('merge: null keeps previous', mergeSnapshot(good, null) === good)
+check('merge: array keeps previous', mergeSnapshot(good, [1, 2]) === good)
+check('merge: string keeps previous', mergeSnapshot(good, 'x') === good)
+const merged = mergeSnapshot(good, { ...good, day_sessions: 9 })
+check('merge: fresh object replaces previous', merged.day_sessions === 9 && merged.ts === 1000, JSON.stringify(merged).slice(0, 60))
+check('age: seconds', formatAge(40) === '40s', formatAge(40))
+check('age: minutes', formatAge(600) === '10m', formatAge(600))
+check('age: hours', formatAge(7200) === '2h', formatAge(7200))
+check('age: days', formatAge(200000) === '2d', formatAge(200000))
+check('age: negative clamps', formatAge(-5) === '0s', formatAge(-5))
+check('stale: fresh stays silent', staleLabel(Date.now() / 1000, Date.now() / 1000) === '', staleLabel(Date.now() / 1000, Date.now() / 1000))
+check('stale: old shows age', staleLabel(Date.now() / 1000 - 300, Date.now() / 1000).startsWith(' · 5m'), staleLabel(Date.now() / 1000 - 300, Date.now() / 1000))
+check('stale: no ts stays silent', staleLabel(0, Date.now() / 1000) === '', staleLabel(0, Date.now() / 1000))
 
-await fsp.writeFile(
-  `${tmpHome}/state/savvy-progress.json`,
-  JSON.stringify({ model: 'tmp/model-x', cost_usd: 0.25, cost_source: 'table', turn: 3 })
-)
-const estimated = await mod.readSnapshot()
-check('readSnapshot passes cost_source=table through', estimated.cost_source === 'table',
-  `cost_source=${estimated.cost_source}`)
+// 16. a seeded stale snapshot must put its age in the title
+const staleTree = captured.render({ t }).type({ t, snapshot: { ...normal, ts: Date.now() / 1000 - 900 } })
+check('card: stale seed labels the title', /· 15m/.test(String(staleTree?.props?.title)), String(staleTree?.props?.title))
+const freshTree = captured.render({ t }).type({ t, snapshot: { ...normal, ts: Date.now() / 1000 } })
+check('card: fresh seed has a plain title', freshTree?.props?.title === 'PROGRESS', String(freshTree?.props?.title))
 
-await fsp.writeFile(
-  `${tmpHome}/state/savvy-progress.json`,
-  JSON.stringify({ model: 'tmp/model-x', cost_usd: 0.0, cost_source: 'none', turn: 3 })
-)
-const unpriced = await mod.readSnapshot()
-check('readSnapshot passes cost_source=none through', unpriced.cost_source === 'none',
-  `cost_source=${unpriced.cost_source}`)
-
-await fsp.writeFile(
-  `${tmpHome}/state/savvy-progress.json`,
-  JSON.stringify({ model: 'tmp/model-x', cost_usd: 0.25, cost_source: 'bogus', turn: 3 })
-)
-const bogus = await mod.readSnapshot()
-check('an invalid cost_source falls back to provider', bogus.cost_source === 'provider',
-  `cost_source=${bogus.cost_source}`)
-
-process.env.HERMES_HOME = previousHome
-await fsp.rm(tmpHome, { recursive: true, force: true })
-
-console.log(`\n${failures.length === 0 ? 'ALL CHECKS PASSED' : `FAILED: ${failures.join(', ')}`}`)
-process.exit(failures.length === 0 ? 0 : 1)
+console.log(`\n${checks - fails.length}/${checks} checks passed`)
+if (fails.length) {
+  console.log('FAILURES:')
+  for (const f of fails) console.log('  -', f)
+  process.exit(1)
+}
+console.log('RESULT: PASS')

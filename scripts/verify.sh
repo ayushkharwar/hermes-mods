@@ -17,6 +17,10 @@ run() {
 
 run "savvy-progress plugin"  python3 tests/savvy-progress/test_plugin.py
 run "savvy-progress widget"  node    tests/savvy-progress/test_widget.mjs
+run "savvy-progress integration" python3 tests/savvy-progress/test_integration.py
+run "savvy-progress hardening"   python3 tests/savvy-progress/test_hardening.py
+run "savvy-progress concurrency" python3 tests/savvy-progress/test_concurrency.py
+run "savvy-progress soak"        python3 tests/savvy-progress/test_soak.py
 run "filetree-rail plugin"   python3 tests/filetree-rail/test_plugin.py
 run "filetree-rail widget"   node    tests/filetree-rail/test_widget.mjs
 run "keepwarm capture"       python3 tests/keepwarm/test_capture.py

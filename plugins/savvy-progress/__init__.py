@@ -75,13 +75,20 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+try:  # POSIX only; a host without fcntl keeps the threading lock as its only guard.
+    import fcntl
+except ImportError:  # pragma: no cover — Windows
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +101,20 @@ MAX_SESSION_TURNS = 24
 SESSION_TTL_S = 6 * 3600.0
 MIN_WRITE_INTERVAL_S = 1.0
 DB_TIMEOUT_S = 1.0
+# The "today" row sums every session started inside this window, so parallel chats and
+# cron runs cannot hide their spend behind the one session the card describes.
+DAY_WINDOW_S = 24 * 3600.0
+# A burn rate divided by a two-minute session is noise, not a rate. Floor the divisor.
+BURN_FLOOR_S = 300.0
+# Day spend scans several tables; the card refreshes on every tool call. Cache the result
+# for a few seconds so a long chat does not re-scan the DB on every hook.
+DAY_CACHE_S = 5.0
+# Hard cap on usage rows summed for the day row: a runaway DB cannot stall a tool call.
+DAY_ROW_LIMIT = 50_000
+# Seconds to wait for the cross-process file lock before skipping this write.
+WRITE_LOCK_TIMEOUT_S = 1.0
+# Optional price overrides, merged over PRICE_TABLE on every mtime change.
+PRICE_OVERRIDE_NAME = "savvy-progress.prices.json"
 
 # --- primary / delegate split ---------------------------------------------------
 # The card describes the user's own interactive session. Everything below it in the
@@ -122,6 +143,8 @@ PIN_ENDED_STALE_S = 30 * 60.0
 # (input + cache read + cache write) divided by that row's api_call_count.
 DEFAULT_CONTEXT_WINDOW = 1_000_000
 _context_cache: Dict[str, Any] = {}
+_price_cache: Dict[str, Any] = {"key": None, "table": None}
+_day_cache: Dict[str, Any] = {"key": None, "value": None}
 
 DELEGATE_DEFAULTS: Dict[str, Any] = {
     "count": 0,
@@ -257,6 +280,23 @@ FROM session_model_usage
 WHERE session_id = ?
 """
 
+# Day spend: every usage row whose session started inside the window. A session with a
+# null start falls back to its last activity, so an old chat that kept running still counts.
+_DAY_SQL = f"""
+SELECT u.model,
+       u.input_tokens,
+       u.output_tokens,
+       u.cache_read_tokens,
+       u.actual_cost_usd,
+       u.estimated_cost_usd,
+       u.session_id
+FROM session_model_usage u
+JOIN sessions s ON s.id = u.session_id
+WHERE COALESCE(NULLIF(s.started_at, 0), NULLIF(s.last_activity_at, 0), 0) >= ?
+  AND COALESCE(NULLIF(s.started_at, 0), NULLIF(s.last_activity_at, 0), 0) < ?
+LIMIT {DAY_ROW_LIMIT}
+"""
+
 
 def _hermes_home() -> Path:
     """Profile-aware home. Falls back to the env var, then to ``~/.hermes``."""
@@ -290,16 +330,149 @@ def _db_path() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{_db_path()}?mode=ro", uri=True, timeout=DB_TIMEOUT_S)
+    conn = sqlite3.connect(f"file:{_db_path()}?mode=ro", uri=True, timeout=DB_TIMEOUT_S)
+    try:
+        conn.execute("PRAGMA query_only = ON")
+    except sqlite3.Error:
+        pass
+    return conn
+
+
+@contextmanager
+def _db() -> Iterator[sqlite3.Connection]:
+    """A read-only connection that always closes.
+
+    ``with sqlite3.connect(...)`` commits on exit but does NOT close the handle, so a card
+    that refreshes on every tool call leaks one file descriptor per query. This wrapper
+    closes it, which is what keeps a long session flat.
+    """
+    conn = _connect()
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:  # pragma: no cover — already closed
+            pass
+
+
+def _safe_rows(sql: str, params: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
+    """Rows for a read-only query, or ``[]``.
+
+    Every DB read goes through here: a missing DB, a locked DB, a corrupt file and a
+    schema change all reduce to "no rows", so the card degrades to zeros instead of
+    killing the tool hook that fired it.
+    """
+    try:
+        with _db() as conn:
+            return conn.execute(sql, params).fetchall()
+    except (sqlite3.Error, OSError) as exc:
+        logger.debug("savvy-progress: query failed (%s): %s", sql.split()[0:2], exc)
+        return []
+    except Exception as exc:  # noqa: BLE001 — a read must never break a turn
+        logger.debug("savvy-progress: unexpected read failure: %s", exc)
+        return []
+
+
+def _safe_row(sql: str, params: Tuple[Any, ...] = ()) -> Optional[Tuple[Any, ...]]:
+    rows = _safe_rows(sql, params)
+    return rows[0] if rows else None
 
 
 def _match_price(model: str) -> Optional[Tuple[float, float, float]]:
-    """Price tuple for a model name, or None. Case-insensitive, longest key wins."""
+    """Price tuple for a model name, or None.
+
+    Case-insensitive substring match, longest key first. An operator override outranks a
+    baked row: if someone writes a rate for an alias, that rate applies to every model id
+    containing the alias, because the override is the more specific statement of intent.
+    """
     name = (model or "").lower()
-    for key in _PRICE_KEYS:
+    overrides = _override_table()
+    for key in sorted(overrides, key=len, reverse=True):
         if key in name:
-            return PRICE_TABLE[key]
+            return overrides[key]
+    table = _price_table()
+    for key in sorted(table, key=len, reverse=True):
+        if key in name:
+            return table[key]
     return None
+
+
+def _load_price_overrides() -> Dict[str, Tuple[float, float, float]]:
+    """``state/savvy-progress.prices.json`` as a price table. Missing or bad rows ignored.
+
+    Format: ``{"model-alias": [input, output, cache_read]}`` in USD per 1M tokens. This
+    lets a rate change or a new model land without editing the plugin, which is the
+    difference between a personal script and something installable.
+    """
+    path = _hermes_home() / "state" / PRICE_OVERRIDE_NAME
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        logger.debug("savvy-progress: price overrides unreadable: %s", exc)
+        return {}
+
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        logger.debug("savvy-progress: price overrides are not JSON: %s", exc)
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    table: Dict[str, Tuple[float, float, float]] = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or not key.strip():
+            continue
+        if isinstance(value, dict):  # tolerate a named-field form
+            value = [value.get("input"), value.get("output"), value.get("cache_read")]
+        if not isinstance(value, (list, tuple)) or len(value) != 3:
+            logger.debug("savvy-progress: price row %r ignored, needs 3 numbers", key)
+            continue
+        try:
+            numbers = tuple(max(0.0, _finite(part)) for part in value)
+        except (TypeError, ValueError):
+            logger.debug("savvy-progress: price row %r ignored, not numeric", key)
+            continue
+        table[key.strip().lower()] = numbers  # type: ignore[assignment]
+    return table
+
+
+def _override_table() -> Dict[str, Tuple[float, float, float]]:
+    """Override rows, cached until the file's mtime changes. A read per render is waste."""
+    path = _hermes_home() / "state" / PRICE_OVERRIDE_NAME
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        stamp = 0
+    if _price_cache.get("override_key") == stamp and isinstance(_price_cache.get("overrides"), dict):
+        return _price_cache["overrides"]  # type: ignore[return-value]
+    table = _load_price_overrides()
+    _price_cache["override_key"] = stamp
+    _price_cache["overrides"] = table
+    return table
+
+
+def _price_table() -> Dict[str, Tuple[float, float, float]]:
+    """``PRICE_TABLE`` merged with the override file, cached until either one changes."""
+    path = _hermes_home() / "state" / PRICE_OVERRIDE_NAME
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        stamp = 0
+    key = (stamp, path.exists())
+    cached = _price_cache.get("key")
+    if cached == key and isinstance(_price_cache.get("table"), dict):
+        return _price_cache["table"]  # type: ignore[return-value]
+
+    table = dict(PRICE_TABLE)
+    table.update(_load_price_overrides())
+    _price_cache["key"] = key
+    _price_cache["table"] = table
+    return table
 
 
 def _resolve_cost(
@@ -338,8 +511,7 @@ def _resolve_cost(
 
 def _read_totals(session_id: str) -> Optional[Dict[str, Any]]:
     """Summed usage for one session, or None when the session is unknown."""
-    with _connect() as conn:
-        rows = conn.execute(_ROWS_SQL, (session_id,)).fetchall()
+    rows = _safe_rows(_ROWS_SQL, (session_id,))
     if not rows:
         return None
 
@@ -398,8 +570,7 @@ def _zero_totals() -> Dict[str, Any]:
 
 def _read_model(session_id: str) -> Tuple[str, str]:
     """The busiest model row for the session: (model, provider)."""
-    with _connect() as conn:
-        row = conn.execute(_MODEL_SQL, (session_id,)).fetchone()
+    row = _safe_row(_MODEL_SQL, (session_id,))
     if not row:
         return "unknown", ""
     model = str(row[0] or "unknown")
@@ -416,16 +587,148 @@ def _read_context_tokens(session_id: str) -> int:
     ``api_call_count`` gives the average prompt per call, and the max over rows is the
     biggest prompt the session has sent. That is the number the TUI status bar tracks.
     """
-    try:
-        with _connect() as conn:
-            row = conn.execute(_CONTEXT_SQL, (session_id,)).fetchone()
-    except sqlite3.Error as exc:
-        logger.debug("savvy-progress: context query failed: %s", exc)
-        return 0
+    row = _safe_row(_CONTEXT_SQL, (session_id,))
     try:
         return max(0, int(row[0] or 0)) if row else 0
     except (TypeError, ValueError):
         return 0
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    """A finite float, or ``default``.
+
+    ``json.dumps`` writes ``Infinity`` and ``NaN`` as bare literals, which are not JSON:
+    the TUI's ``JSON.parse`` throws and the whole card falls back to zeros. One bad cost
+    float must never blank the card, so every float leaves here finite.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _int_value(value: Any, default: int = 0) -> int:
+    """An int, or ``default``. A hostile payload can carry a list where a count belongs."""
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _read_session_start(session_id: str) -> float:
+    """``started_at`` for one session, or 0.0. Never raises."""
+    row = _safe_row("SELECT started_at FROM sessions WHERE id = ?", (session_id,))
+    try:
+        return max(0.0, float(row[0] or 0.0)) if row else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _burn_rate(cost_usd: float, started_at: float, now: float) -> Tuple[float, float]:
+    """``(cost_per_hour, elapsed_s)`` for the session. Elapsed floors at BURN_FLOOR_S.
+
+    A session three minutes old produces a rate that is technically true and useless, so
+    a short session reports the rate for its first five minutes instead of a spike.
+    """
+    try:
+        elapsed = float(now) - float(started_at)
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    if elapsed <= 0.0 or float(started_at) <= 0.0:
+        # A zero start means the row has no clock, not that the chat began at the epoch.
+        return 0.0, 0.0
+    hours = max(elapsed, BURN_FLOOR_S) / 3600.0
+    try:
+        rate = _finite(cost_usd) / hours
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0, elapsed
+    # Two decimals is what the card shows, and it keeps the payload stable for minutes:
+    # a payload that changes every second rewrites and fsyncs the file on every tool call.
+    return round(_finite(rate), 2), elapsed
+
+
+def _cache_saved_usd(model: str, cache_read: int) -> Tuple[float, str]:
+    """Dollars a cache hit avoided: cached tokens billed at the cache rate, not input.
+
+    ``(0.0, "none")`` when the model has no price row, so the card prints n/a instead of
+    inventing a saving.
+    """
+    price = _match_price(model)
+    if price is None:
+        return 0.0, "none"
+    price_in, _price_out, price_cache = price
+    try:
+        tokens = max(0, int(cache_read or 0))
+    except (TypeError, ValueError):
+        tokens = 0
+    saved = (tokens / 1_000_000.0) * max(0.0, price_in - price_cache)
+    return round(saved, 6), "table"
+
+
+def _day_bounds(now: float) -> Tuple[float, float]:
+    """Local calendar day ``[00:00, next 00:00)`` as epoch seconds.
+
+    The "today" row answers a question the user can check against their own clock: spend
+    since midnight. A rolling 24 h window showed yesterday evening's chats as today's, which
+    reads as a miscount. DST is handled by asking ``mktime`` to normalise the next day.
+    """
+    lt = time.localtime(now)
+    year, month, day = lt.tm_year, lt.tm_mon, lt.tm_mday
+    start = time.mktime((year, month, day, 0, 0, 0, 0, 0, -1))
+    end = time.mktime((year, month, day + 1, 0, 0, 0, 0, 0, -1))
+    if end <= start:  # a broken TZ database: fall back to 24 h from midnight
+        end = start + 86400.0
+    return start, end
+
+
+def _day_spend(now: float) -> Dict[str, Any]:
+    """Every session started today, priced together.
+
+    The card follows one session; this is the only row that can see the cron runs, the
+    delegate children and the other terminal. Returns ``cost_usd``, ``cost_source`` and
+    the number of distinct sessions, zeros included, so a quiet day reads $0, not n/a.
+    """
+    start, end = _day_bounds(now)
+    bucket = int(now // DAY_CACHE_S)
+    try:
+        db_stamp = _db_path().stat()
+        key = (bucket, round(start, 3), round(end, 3), db_stamp.st_mtime_ns, db_stamp.st_size)
+    except OSError:
+        key = (bucket, round(start, 3), round(end, 3), 0, 0)
+    if _day_cache.get("key") == key and isinstance(_day_cache.get("value"), dict):
+        return dict(_day_cache["value"])  # type: ignore[arg-type]
+
+    rows = _safe_rows(_DAY_SQL, (start, end))
+    if len(rows) >= DAY_ROW_LIMIT:
+        logger.debug("savvy-progress: day spend hit the %d row cap", DAY_ROW_LIMIT)
+
+    total = 0.0
+    sources = set()
+    sessions = set()
+    for model, r_in, r_out, r_cache, actual, estimated, session_id in rows:
+        row_cost, row_source = _resolve_cost(
+            str(model or ""),
+            int(r_in or 0),
+            int(r_out or 0),
+            int(r_cache or 0),
+            actual,
+            estimated,
+        )
+        total += row_cost
+        sources.add(row_source)
+        sessions.add(str(session_id or ""))
+
+    if "provider" in sources:
+        source = "provider"
+    elif "table" in sources:
+        source = "table"
+    else:
+        source = "none"
+    result = {"cost_usd": round(_finite(total), 6), "cost_source": source, "sessions": len(sessions)}
+    _day_cache["key"] = key
+    _day_cache["value"] = dict(result)
+    return dict(result)
 
 
 def _context_window() -> int:
@@ -485,12 +788,15 @@ def _read_session_table() -> Optional[Dict[str, Dict[str, Any]]]:
     Python keeps the depth cap and the cycle guard obvious.
     """
     try:
-        with _connect() as conn:
+        with _db() as conn:
             cur = conn.execute(_SESSIONS_SQL)
             names = [col[0] for col in cur.description or ()]
             raw = cur.fetchall()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, OSError) as exc:
         logger.debug("savvy-progress: sessions table unusable: %s", exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 — the card must never break a turn
+        logger.debug("savvy-progress: unexpected sessions read failure: %s", exc)
         return None
 
     table: Dict[str, Dict[str, Any]] = {}
@@ -549,28 +855,13 @@ def _read_pin() -> Tuple[Optional[str], float]:
     return sid, ts
 
 
-def _write_pin(session_id: str, ts: Optional[float] = None) -> None:
+def _write_pin(session_id: str, ts: Optional[float] = None) -> bool:
     """Atomic write, mode 0600: the file names one session, so keep it private."""
     sid = str(session_id or "")
     if not sid:
-        return
-    path = _pin_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / (path.name + ".tmp")
+        return False
     payload = {"session_id": sid, "ts": round(time.time() if ts is None else float(ts), 3)}
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2)
-            fh.write("\n")
-        os.chmod(tmp, 0o600)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    os.replace(tmp, path)
+    return _write_json_atomic(_pin_path(), payload)
 
 
 def _drop_pin() -> None:
@@ -592,20 +883,15 @@ def _pin_session(session_id: str) -> bool:
     sid = str(session_id or "")
     if not sid.startswith(PRIMARY_PREFIX):
         return False
-    try:
-        with _connect() as conn:
-            row = conn.execute(_PIN_ELIGIBLE_SQL, (sid, PRIMARY_SOURCE)).fetchone()
-    except sqlite3.Error as exc:
-        logger.debug("savvy-progress: pin eligibility query failed: %s", exc)
-        return False
+    row = _safe_row(_PIN_ELIGIBLE_SQL, (sid, PRIMARY_SOURCE))
     if row is None:
         return False
     try:
-        _write_pin(sid)
+        wrote = _write_pin(sid)
     except Exception as exc:
         logger.debug("savvy-progress: pin write failed: %s", exc)
         return False
-    return True
+    return bool(wrote)
 
 
 def _pinned_session(
@@ -668,7 +954,7 @@ def _primary_from_table(table: Dict[str, Dict[str, Any]], now: float) -> Optiona
 def _primary_from_usage(now: float) -> Optional[str]:
     """Last resort for databases without a usable ``sessions`` table: id prefix only."""
     try:
-        with _connect() as conn:
+        with _db() as conn:
             local = conn.execute(_LATEST_PRIMARY_SQL).fetchone()
             if local is not None:
                 try:
@@ -796,10 +1082,13 @@ def _delegate_totals(
     else:
         # Old database without a sessions table: keep the id-prefix rule as a last resort.
         try:
-            with _connect() as conn:
+            with _db() as conn:
                 rows = conn.execute(_DELEGATE_USAGE_SQL, (now - DELEGATE_WINDOW_S,)).fetchall()
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, OSError) as exc:
             logger.debug("savvy-progress: delegate scan failed: %s", exc)
+            rows = []
+        except Exception as exc:  # noqa: BLE001 — the card must never break a turn
+            logger.debug("savvy-progress: unexpected delegate scan failure: %s", exc)
             rows = []
         for (sid,) in rows:
             if str(sid) == primary_id:
@@ -831,13 +1120,117 @@ def _read_prev(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _write_snapshot(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _write_snapshot(path: Path, payload: Dict[str, Any]) -> bool:
+    """Atomic private write of one JSON object. Returns False instead of raising."""
+    return _write_json_atomic(path, payload)
+
+
+@contextmanager
+def _write_lock(path: Path) -> Iterator[bool]:
+    """Best-effort cross-process lock for one target file.
+
+    Yields ``True`` when the lock was taken. A second Hermes process (a oneshot run, a
+    cron worker) can fire the same hook, and two writers interleaving a read-modify-write
+    would drop a session's turn history. The lock is advisory and bounded: on timeout the
+    caller skips this write and keeps the previous file, which is always valid.
+    """
+    if fcntl is None:
+        yield True
+        return
+
+    lock_path = path.parent / (path.name + ".lock")
+    handle = None
+    taken = False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        deadline = time.time() + WRITE_LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                taken = True
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    logger.debug("savvy-progress: write lock busy for %s, skipping", path.name)
+                    break
+                time.sleep(0.01)
+        yield taken
+    except OSError as exc:
+        logger.debug("savvy-progress: lock unavailable for %s: %s", path.name, exc)
+        yield False
+    finally:
+        if handle is not None:
+            try:
+                if taken:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(handle)
+            except OSError:
+                pass
+
+
+def _write_json_atomic(path: Path, data: Any) -> bool:
+    """Write ``data`` to ``path`` atomically and privately. Never raises.
+
+    Layers, outermost first:
+      * cross-process lock, so two Hermes processes cannot interleave one file
+      * ``.tmp`` beside the target, so ``os.replace`` stays atomic on one filesystem
+      * mode 0600 set before the rename, so the visible file is never world-readable
+      * ``fsync`` before the rename, so a crash cannot expose a zero-byte file
+      * ``allow_nan=False``, so no ``Infinity``/``NaN`` literal ever lands on disk
+
+    A failure leaves the previous file untouched, which the widget keeps polling.
+    """
     tmp = path.parent / (path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)
+    try:
+        with _write_lock(path) as taken:
+            if not taken:
+                return False
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                try:
+                    text = json.dumps(data, indent=2, allow_nan=False)
+                except (TypeError, ValueError):
+                    # A non-finite or exotic object slipped through: write the safe form
+                    # instead of corrupting the file the TUI parses strictly.
+                    text = json.dumps(_json_safe(data), indent=2, allow_nan=False)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(text + "\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.chmod(tmp, 0o600)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            os.replace(tmp, path)
+            return True
+    except Exception as exc:  # noqa: BLE001 — a write must never break a turn
+        logger.debug("savvy-progress: write failed for %s: %s", path.name, exc)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _json_safe(value: Any) -> Any:
+    """Deep copy with every non-finite float replaced by 0.0. Never raises."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else 0.0
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    return str(value)
 
 
 _SAFE_ID = re.compile(r"[^A-Za-z0-9._-]")
@@ -904,23 +1297,9 @@ def _read_sessions(path: Optional[Path] = None) -> Dict[str, Any]:
     return {str(sid): entry for sid, entry in sessions.items() if isinstance(entry, dict)}
 
 
-def _write_sessions(path: Path, sessions: Dict[str, Any]) -> None:
-    """Atomic write, mode 0600: the file holds session ids, so keep it private."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / (path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"sessions": sessions}, fh, indent=2)
-            fh.write("\n")
-        os.chmod(tmp, 0o600)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    os.replace(tmp, path)
+def _write_sessions(path: Path, sessions: Dict[str, Any]) -> bool:
+    """Atomic, mode-0600 write of the session history. Returns False instead of raising."""
+    return _write_json_atomic(path, {"sessions": sessions})
 
 
 def _prune_sessions(sessions: Dict[str, Any], now: float) -> Dict[str, Any]:
@@ -1097,6 +1476,12 @@ def _build_snapshot(
         total_sources.append(delegates["cost_source"])
     total_cost = round(float(primary["cost_usd"]) + float(delegates["cost_usd"]), 6)
 
+    cost_source = _combine_sources(total_sources)
+    day_start, day_end = _day_bounds(now)
+    day = _day_spend(now)
+    burn_usd_per_hour, _elapsed_s = _burn_rate(total_cost, _read_session_start(primary_id), now)
+    cache_saved, cache_saved_source = _cache_saved_usd(model, primary["cache_read"])
+
     payload = {
         "ts": round(now, 3),
         "session_id": primary_id,
@@ -1112,13 +1497,26 @@ def _build_snapshot(
         "cost_usd": primary["cost_usd"],
         # Describes the cost the card shows. With no delegates that is the primary's own
         # source, so a single-session run is byte-identical to the old contract.
-        "cost_source": _combine_sources(total_sources),
+        "cost_source": cost_source,
         "turns": primary_turns,
         "primary_session": primary_id,
         "delegates": delegates,
-        "total_cost_usd": total_cost,
+        "total_cost_usd": _finite(total_cost),
         "context_tokens": _read_context_tokens(primary_id),
         "context_window": _context_window(),
+        # Burn is the total cost over the session's own wall clock. It follows cost_source:
+        # a provider number burns a real rate, a table number burns an estimate.
+        "burn_usd_per_hour": _finite(burn_usd_per_hour),
+        "burn_source": cost_source,
+        # Saved is always a table number: it compares the cache rate against list input
+        # price, which no provider reports.
+        "cache_saved_usd": _finite(cache_saved),
+        "cache_saved_source": cache_saved_source,
+        # Day spend sees the sessions the card cannot: cron, delegates, other terminals.
+        "day_cost_usd": _finite(day["cost_usd"]),
+        "day_source": day["cost_source"],
+        "day_sessions": day["sessions"],
+        "day_window_s": round(day_end - day_start, 1),
     }
     new_entry = {
         "turn": turn,
@@ -1163,46 +1561,59 @@ def snapshot(session_id: str) -> Optional[Dict[str, Any]]:
         if now - _last_write < MIN_WRITE_INTERVAL_S:
             return None
 
-        path = _snapshot_path()
-        sessions_path = _sessions_path()
-        prev = _read_prev(path)
-        stored = _read_sessions(sessions_path)
-        sessions = _prune_sessions(stored, now)
-        table = _read_session_table()
-
-        payload, entry = _build_snapshot(
-            session_id, prev, sessions.get(session_id), sessions, now, table
-        )
-        if payload is None or entry is None:
+        try:
+            return _snapshot_locked(session_id, now)
+        except Exception as exc:  # noqa: BLE001 — a hook must never break the turn
+            logger.debug("savvy-progress: snapshot aborted, previous file kept: %s", exc)
             return None
 
-        sessions[session_id] = entry
-        sessions = _prune_sessions(sessions, now)
 
-        # The firing session's own view: its numbers and only the delegates it spawned.
-        # Every session gets one, so two chats never share a counter.
-        try:
-            own_payload, _own_entry = _build_snapshot(
-                session_id, None, entry, sessions, now, table, self_view=True
-            )
-            if own_payload is not None:
-                _publish_session_file(session_id, own_payload)
-        except Exception as exc:
-            logger.debug("savvy-progress: per-session view failed: %s", exc)
+def _snapshot_locked(session_id: str, now: float) -> Optional[Dict[str, Any]]:
+    """The body of :func:`snapshot`, under the write lock. May raise; the caller guards."""
+    global _last_write
 
-        snapshot_changed = not (_unchanged(prev, payload) and path.exists())
-        sessions_changed = not _entry_same(stored.get(session_id), entry) or not sessions_path.exists()
+    path = _snapshot_path()
+    sessions_path = _sessions_path()
+    prev = _read_prev(path)
+    stored = _read_sessions(sessions_path)
+    sessions = _prune_sessions(stored, now)
+    table = _read_session_table()
 
-        if not snapshot_changed and not sessions_changed:
-            _last_write = now
-            return payload
+    payload, entry = _build_snapshot(
+        session_id, prev, sessions.get(session_id), sessions, now, table
+    )
+    if payload is None or entry is None:
+        return None
 
-        if sessions_changed:
-            _write_sessions(sessions_path, sessions)
-        if snapshot_changed:
-            _write_snapshot(path, payload)
+    sessions[session_id] = entry
+    sessions = _prune_sessions(sessions, now)
+
+    # The firing session's own view: its numbers and only the delegates it spawned.
+    # Every session gets one, so two chats never share a counter.
+    try:
+        own_payload, _own_entry = _build_snapshot(
+            session_id, None, entry, sessions, now, table, self_view=True
+        )
+        if own_payload is not None:
+            _publish_session_file(session_id, own_payload)
+    except Exception as exc:
+        logger.debug("savvy-progress: per-session view failed: %s", exc)
+
+    snapshot_changed = not (_unchanged(prev, payload) and path.exists())
+    sessions_changed = not _entry_same(stored.get(session_id), entry) or not sessions_path.exists()
+
+    if not snapshot_changed and not sessions_changed:
         _last_write = now
         return payload
+
+    # A failed write keeps the previous file: the widget keeps polling a valid card,
+    # and the next hook retries. Never let an EACCES or a full disk surface as a turn error.
+    if sessions_changed and not _write_sessions(sessions_path, sessions):
+        logger.debug("savvy-progress: session history write skipped, previous file kept")
+    if snapshot_changed and not _write_snapshot(path, payload):
+        logger.debug("savvy-progress: snapshot write skipped, previous file kept")
+    _last_write = now
+    return payload
 
 
 def _on_post_tool_call(**kwargs: Any) -> None:
@@ -1257,7 +1668,7 @@ def _thousands(value: Any) -> str:
     """12345 -> '12,345'. Never raises on odd payloads."""
     try:
         return f"{int(value or 0):,}"
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return "0"
 
 
@@ -1278,6 +1689,18 @@ def _cost_text(cost: Any, source: str) -> Tuple[str, str]:
     if source == "table":
         return f"~{body}", "list price"
     return body, ""
+
+
+def _rate_text(cost: Any, source: str) -> str:
+    """``$0.55/h`` for the burn row. ``table`` marks an estimate, ``none`` prints n/a."""
+    if source == "none":
+        return "$n/a/h"
+    try:
+        amount = max(0.0, float(cost or 0.0))
+    except (TypeError, ValueError):
+        amount = 0.0
+    body = f"${amount:.2f}/h"
+    return f"~{body}" if source == "table" else body
 
 
 def _age_text(seconds: float) -> str:
@@ -1346,10 +1769,7 @@ def render_card(payload: Dict[str, Any]) -> str:
 
     delegates = payload.get("delegates")
     delegates = delegates if isinstance(delegates, dict) else {}
-    try:
-        delegate_count = int(delegates.get("count") or 0)
-    except (TypeError, ValueError):
-        delegate_count = 0
+    delegate_count = max(0, _int_value(delegates.get("count")))
     delegate_source = str(delegates.get("cost_source") or "none")
     if delegate_source not in ("provider", "table", "none"):
         delegate_source = "none"
@@ -1365,11 +1785,23 @@ def render_card(payload: Dict[str, Any]) -> str:
     except (TypeError, ValueError):
         hit = 0.0
     if not hit:
-        hit = _cache_hit_pct(int(cache_read), int(tokens_in))
+        hit = _cache_hit_pct(_int_value(cache_read), _int_value(tokens_in))
 
     cost_value, cost_suffix = _cost_text(total, source)
     suffix = f"   {cost_suffix}" if cost_suffix else ""
     rule = RULE * (CARD_W - 2)
+
+    saved_source = str(payload.get("cache_saved_source") or "none")
+    if saved_source not in ("provider", "table", "none"):
+        saved_source = "none"
+    saved_value, saved_suffix = _cost_text(payload.get("cache_saved_usd"), saved_source)
+
+    day_source = str(payload.get("day_source") or "none")
+    if day_source not in ("provider", "table", "none"):
+        day_source = "none"
+    day_value, _day_suffix = _cost_text(payload.get("day_cost_usd"), day_source)
+    day_sessions = max(0, _int_value(payload.get("day_sessions")))
+    day_tail = f"   {day_sessions} chat{'s' if day_sessions != 1 else ''}"
 
     primary_id = str(payload.get("primary_session") or payload.get("session_id") or "")
     tail = primary_id[-12:] if primary_id else "unknown"
@@ -1384,14 +1816,8 @@ def render_card(payload: Dict[str, Any]) -> str:
     else:
         agents_row = _row("agents", "none")
 
-    try:
-        ctx_tokens = max(0, int(payload.get("context_tokens") or 0))
-    except (TypeError, ValueError):
-        ctx_tokens = 0
-    try:
-        ctx_window = int(payload.get("context_window") or 0)
-    except (TypeError, ValueError):
-        ctx_window = 0
+    ctx_tokens = max(0, _int_value(payload.get("context_tokens")))
+    ctx_window = _int_value(payload.get("context_window"))
     if ctx_window <= 0:
         ctx_window = DEFAULT_CONTEXT_WINDOW
     ctx_pct = min(100.0, ctx_tokens / ctx_window * 100.0)
@@ -1411,11 +1837,19 @@ def render_card(payload: Dict[str, Any]) -> str:
         _row("cache read", _thousands(cache_read)),
         context_row,
         _row("cost", cost_value, suffix),
+        _row("burn/hour", _rate_text(payload.get("burn_usd_per_hour"), source)),
+        _row("cache saved", saved_value, f"   {saved_suffix}" if saved_suffix else ""),
+        _row("today", day_value, day_tail),
         agents_row,
         rule,
     ]
 
-    turns = [t for t in (payload.get("turns") or []) if isinstance(t, dict)][-5:]
+    turns_raw = payload.get("turns")
+    turns = (
+        [t for t in turns_raw if isinstance(t, dict)][-5:]
+        if isinstance(turns_raw, (list, tuple))
+        else []
+    )
     if turns:
         lines.append(f"  ▸ last {len(turns)} turns")
         lines.extend(_turn_row(turn, source) for turn in turns)
@@ -1466,3 +1900,5 @@ def register(ctx: Any) -> None:
         )
     except Exception as exc:
         logger.debug("savvy-progress: command not registered: %s", exc)
+
+
