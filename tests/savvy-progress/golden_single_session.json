@@ -1,0 +1,70 @@
+[
+  {
+    "session_id": "golden-A",
+    "model": "deepseek-v4.1-flash",
+    "provider": "custom",
+    "turn": 0,
+    "api_calls": 3,
+    "input_tokens": 1000,
+    "output_tokens": 100,
+    "cache_read": 500,
+    "cache_write": 0,
+    "cache_hit_pct": 33.3,
+    "cost_usd": 0.000423,
+    "cost_source": "table",
+    "turns": []
+  },
+  {
+    "session_id": "golden-A",
+    "model": "deepseek-v4.1-flash",
+    "provider": "custom",
+    "turn": 1,
+    "api_calls": 5,
+    "input_tokens": 4000,
+    "output_tokens": 400,
+    "cache_read": 2000,
+    "cache_write": 0,
+    "cache_hit_pct": 33.3,
+    "cost_usd": 0.001692,
+    "cost_source": "table",
+    "turns": [
+      {
+        "in": 3000,
+        "out": 300,
+        "cache": 1500,
+        "cost": 0.001269,
+        "i": 1
+      }
+    ]
+  },
+  {
+    "session_id": "golden-A",
+    "model": "deepseek-v4.1-flash",
+    "provider": "custom",
+    "turn": 2,
+    "api_calls": 9,
+    "input_tokens": 12000,
+    "output_tokens": 900,
+    "cache_read": 8000,
+    "cache_write": 0,
+    "cache_hit_pct": 40.0,
+    "cost_usd": 0.004728,
+    "cost_source": "table",
+    "turns": [
+      {
+        "in": 3000,
+        "out": 300,
+        "cache": 1500,
+        "cost": 0.001269,
+        "i": 1
+      },
+      {
+        "in": 8000,
+        "out": 500,
+        "cache": 6000,
+        "cost": 0.003036,
+        "i": 2
+      }
+    ]
+  }
+]

@@ -1,0 +1,6 @@
+name: filetree-rail
+version: "0.1.0"
+description: Records file read/write activity for the Hermes TUI filetree rail
+author: Shion
+provides_hooks:
+  - post_tool_call

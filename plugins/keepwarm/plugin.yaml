@@ -1,0 +1,14 @@
+name: keepwarm
+version: "0.1.0"
+description: "Replays this session's last captured provider request with max_tokens=1 on a timer, so the server side prompt cache stays warm. Start with /keepwarm, stop with /keepwarm-stop."
+author: NousResearch
+kind: standalone
+platforms:
+  - linux
+  - macos
+provides_hooks:
+  - pre_api_request
+  - post_api_request
+provides_commands:
+  - keepwarm
+  - keepwarm-stop
