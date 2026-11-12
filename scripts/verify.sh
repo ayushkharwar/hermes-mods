@@ -27,6 +27,7 @@ run "keepwarm capture"       python3 tests/keepwarm/test_capture.py
 run "keepwarm ping"          python3 tests/keepwarm/test_ping.py
 run "keepwarm stop"          python3 tests/keepwarm/test_stop.py
 run "keepwarm truncated"     python3 tests/keepwarm/test_truncated.py
+run "keepwarm fallback"    python3 tests/keepwarm/test_fallback.py
 
 echo
 if [ "$fail" -ne 0 ]; then

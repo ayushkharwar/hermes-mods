@@ -13,7 +13,7 @@ no patch of the Hermes source.
 |---|---|---|
 | `savvy-progress` | plugin + widget | Live card for your current chat: model, tokens, cache hit rate, context usage, cost, burn rate, cache savings, today's spend across every session, and the cost of delegate children that chat spawned |
 | `filetree-rail` | plugin + widget | Ambient rail of files the agent read or wrote, plus a modal `/explorer` with keyboard navigation and a file preview |
-| `keepwarm` | plugin | `/keepwarm` replays the session's last API request with `max_tokens=1` on a timer, so the provider prompt cache stays warm until `/keepwarm-stop` |
+| `keepwarm` | plugin | `/keepwarm` replays the session's last API request with `max_tokens=1` on a timer, so the provider prompt cache stays warm until `/keepwarm-stop`. If the relay rejects the body's tool array, the ping retries without tools and keeps the conversation prefix, which is what the cache actually matches |
 
 ## Install
 

@@ -300,8 +300,46 @@ def _endpoint(base_url: str) -> str:
     return base + "/chat/completions"
 
 
+def _body_variants(record: dict) -> list[tuple[str, dict]]:
+    """Ping bodies in order of preference: full, tool-free, tool-free without reasoning.
+
+    The cached prefix is the conversation, not the tool schema: dropping ``tools`` still
+    produced a 99.9% cache read on a provider that rejects the full body, and a request
+    with 24 tool schemas came back HTTP 400 on the same relay. A tool-free replay is the
+    difference between "warming works" and "three 400s, then stop".
+    """
+    base = _chat_body(record)
+    if not base:
+        return []
+    body = copy.deepcopy(base)
+    body["max_tokens"] = MAX_TOKENS_FORCED
+    body["stream"] = False
+    # stream_options is only valid with stream=true; some OpenAI-compatible
+    # endpoints reject it outright. It does not affect the cached prefix.
+    body.pop("stream_options", None)
+    if "max_completion_tokens" in body:
+        body["max_completion_tokens"] = MAX_TOKENS_FORCED
+
+    variants: list[tuple[str, dict]] = [("full", dict(body))]
+    if body.get("tools"):
+        lean = copy.deepcopy(body)
+        lean.pop("tools", None)
+        lean.pop("tool_choice", None)
+        lean.pop("parallel_tool_calls", None)
+        variants.append(("no-tools", lean))
+        if "reasoning_effort" in lean:
+            leaner = copy.deepcopy(lean)
+            leaner.pop("reasoning_effort", None)
+            variants.append(("no-tools-no-reasoning", leaner))
+    return variants
+
+
+#: Status codes where trying a leaner body is worth one more request.
+_RETRYABLE = {400, 413, 422}
+
+
 def ping_once(timeout: float = PING_TIMEOUT_S) -> dict:
-    """One warm ping. Returns {"ok": bool, "usage": dict, "error": str}."""
+    """One warm ping. Returns {"ok": bool, "usage": dict, "error": str, "mode": str}."""
     record = _read_json(capture_path())
     if not record:
         return {"ok": False, "usage": {}, "error": "no captured request"}
@@ -315,50 +353,55 @@ def ping_once(timeout: float = PING_TIMEOUT_S) -> dict:
     if not key:
         return {"ok": False, "usage": {}, "error": "no api key found"}
 
-    body = _chat_body(record)
-    if not body:
+    variants = _body_variants(record)
+    if not variants:
         return {"ok": False, "usage": {}, "error": "capture has no chat body"}
-    body["max_tokens"] = MAX_TOKENS_FORCED
-    body["stream"] = False
-    # stream_options is only valid with stream=true; some OpenAI-compatible
-    # endpoints reject it outright. It does not affect the cached prefix.
-    body.pop("stream_options", None)
-    if "max_completion_tokens" in body:
-        body["max_completion_tokens"] = MAX_TOKENS_FORCED
 
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    request = urlrequest.Request(
-        _endpoint(base_url),
-        data=data,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + key,
-        },
-    )
-    try:
-        with urlrequest.urlopen(request, timeout=timeout) as response:
-            raw = response.read()
-    except urlerror.HTTPError as exc:
-        detail = ""
+    last: dict = {"ok": False, "usage": {}, "error": "no attempt ran", "mode": ""}
+    for mode, body in variants:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        request = urlrequest.Request(
+            _endpoint(base_url),
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + key,
+            },
+        )
         try:
-            detail = exc.read().decode("utf-8", "replace")
-        except Exception:
+            with urlrequest.urlopen(request, timeout=timeout) as response:
+                raw = response.read()
+        except urlerror.HTTPError as exc:
             detail = ""
-        return {"ok": False, "usage": {},
-                "error": _redact(f"HTTP {exc.code}: {detail}", key)}
-    except Exception as exc:
-        return {"ok": False, "usage": {},
-                "error": _redact(f"{type(exc).__name__}: {exc}", key)}
+            try:
+                detail = exc.read().decode("utf-8", "replace")
+            except Exception:
+                detail = ""
+            last = {"ok": False, "usage": {}, "mode": mode,
+                    "error": _redact(f"HTTP {exc.code} [{mode}]: {detail}", key)}
+            if exc.code in _RETRYABLE and mode != variants[-1][0]:
+                continue
+            return last
+        except Exception as exc:
+            last = {"ok": False, "usage": {}, "mode": mode,
+                    "error": _redact(f"{type(exc).__name__}: {exc}", key)}
+            continue
+        return _parse_ping(raw, key, mode)
 
+    return last
+
+
+def _parse_ping(raw: bytes, key: str, mode: str) -> dict:
+    """Turn one successful HTTP body into a ping result."""
     try:
         parsed = json.loads(raw.decode("utf-8", "replace") or "{}")
     except ValueError:
-        return {"ok": False, "usage": {}, "error": "response was not JSON"}
+        return {"ok": False, "usage": {}, "mode": mode, "error": "response was not JSON"}
     if isinstance(parsed, dict) and parsed.get("error"):
-        return {"ok": False, "usage": {},
+        return {"ok": False, "usage": {}, "mode": mode,
                 "error": _redact(f"provider error: {parsed.get('error')}", key)}
-    return {"ok": True, "usage": _extract_usage(parsed), "error": ""}
+    return {"ok": True, "usage": _extract_usage(parsed), "error": "", "mode": mode}
 
 
 # --------------------------------------------------------------------------- loop state
@@ -382,6 +425,7 @@ class _Keepwarm:
         self.cache_read_total = 0
         self.output_total = 0
         self.stop_reason = ""
+        self.last_mode = ""
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -395,6 +439,7 @@ class _Keepwarm:
                 "last_error": self.last_error,
                 "last_usage": dict(self.last_usage),
                 "est_cache_read_tokens": self.cache_read_total,
+                "last_mode": self.last_mode,
                 "last_ping_at": self.last_ping_at,
                 "stop_reason": self.stop_reason,
             }
@@ -442,6 +487,7 @@ def _record(result: dict) -> None:
             _S.consecutive_failures = 0
             _S.last_usage = dict(usage)
             _S.last_error = ""
+            _S.last_mode = str(result.get("mode") or "")
             _S.cache_read_total += int(usage.get("cache_read_tokens") or 0)
             _S.output_total += int(usage.get("completion_tokens") or 0)
         else:
@@ -500,6 +546,7 @@ def start_loop(interval_s: float = DEFAULT_INTERVAL_S) -> bool:
         _S.cache_read_total = 0
         _S.output_total = 0
         _S.stop_reason = ""
+        _S.last_mode = ""
         thread = threading.Thread(
             target=_loop, args=(float(_S.interval),),
             name="keepwarm", daemon=True,
@@ -564,6 +611,20 @@ def _duration(seconds: float) -> str:
     return f"{secs}s"
 
 
+def _is_priced(model: str) -> bool:
+    """True when the capture's model is the priced one, with or without its provider prefix.
+
+    The capture carries the alias the config uses (``deepseek-v4.1-flash``) while the price
+    row is the fully qualified id, so an exact match would report "not priced" on every
+    real session, which reads as "this costs nothing to run".
+    """
+    name = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if not name:
+        return False
+    priced = PRICED_MODEL.lower().rsplit("/", 1)[-1]
+    return name in priced or priced in name
+
+
 def card() -> str:
     """Status card. Aligned labels, thousands separators, no raw JSON, <= 46 cols."""
     snap = _S.snapshot()
@@ -572,7 +633,7 @@ def card() -> str:
     cache_read = int(snap.get("est_cache_read_tokens") or 0)
     output = int(_S.output_total or 0)
     model = str(_read_json(capture_path()).get("model") or "")
-    priced = bool(model) and model == PRICED_MODEL
+    priced = _is_priced(model)
     cost = 0.0
     if priced:
         cost = (cache_read / 1_000_000.0) * CACHE_READ_USD_PER_M
@@ -586,6 +647,7 @@ def card() -> str:
         _row("Cache reads", f"{cache_read:,} tok"),
         _row("Cost (est)", f"${cost:.4f}" if priced else "not priced"),
         _row("Prompt tok", f"{int(usage.get('prompt_tokens') or 0):,}"),
+        *([_row("Mode", str(snap.get("last_mode")))] if snap.get("last_mode") not in ("", "full") else []),
         _row("Last ping", _clock(float(snap.get("last_ping_at") or 0))),
         _row("Started", _clock(float(snap.get("started_at") or 0))),
     ]
