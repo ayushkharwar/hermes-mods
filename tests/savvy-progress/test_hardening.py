@@ -78,12 +78,16 @@ def tiny_db(path: Path, sessions: int = 3, rows_per: int = 1) -> None:
         """
     )
     now = time.time()
+    # Anchor every row just after local midnight: the day row is a calendar day, so rows
+    # built as "now minus N seconds" fall into yesterday when the suite runs after midnight.
+    lt = time.localtime(now)
+    midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
     for i in range(sessions):
         sid = f"local-{i:06d}"
         conn.execute(
             "INSERT INTO sessions (id, parent_session_id, created_source, model, started_at, last_activity_at)"
             " VALUES (?, NULL, 'tui', 'deepseek-v4.1-flash', ?, ?)",
-            (sid, now - 600 - i, now - 300),
+            (sid, midnight + 60 + i, midnight + 120),
         )
         for r in range(rows_per):
             conn.execute(
@@ -91,7 +95,7 @@ def tiny_db(path: Path, sessions: int = 3, rows_per: int = 1) -> None:
                 " input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, estimated_cost_usd,"
                 " actual_cost_usd, last_seen) VALUES (?, 'deepseek-v4.1-flash', 'custom', 2, 1000, 200,"
                 " 500000, 0, 0, 0, ?)",
-                (sid, now - 300 - r),
+                (sid, midnight + 120 + r),
             )
     conn.commit()
     conn.close()

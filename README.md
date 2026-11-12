@@ -30,6 +30,11 @@ bash scripts/install.sh
 The `savvy-progress` card and `/progress` exist only in `hermes --tui`; `/svprogress` prints
 the same snapshot as text in either interface.
 
+`keepwarm` can also be armed without a slash command: write
+`$HERMES_HOME/state/keepwarm-arm.json` with `{"action": "start", "interval_s": 240, "ts": <unix>}`
+and the next API hook starts the loop. `{"action": "stop"}` stops it. Requests older than
+five minutes are consumed and ignored.
+
 Then, inside `hermes --tui`:
 
 ```

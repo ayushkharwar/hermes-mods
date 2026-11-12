@@ -43,6 +43,12 @@ MIN_INTERVAL_S = 60
 MAX_INTERVAL_S = 1800
 CAPTURE_THROTTLE_S = 5.0
 
+#: A start/stop request written to ``state/keepwarm-arm.json`` is honored for this many
+#: seconds, so a script can arm the loop without a slash command and a stale file cannot
+#: resurrect it a week later.
+ARM_TTL_S = 300.0
+ARM_NAME = "keepwarm-arm.json"
+
 MAX_PINGS = 60
 MAX_RUNTIME_S = 3 * 3600
 MAX_CONSECUTIVE_FAILURES = 3
@@ -77,6 +83,10 @@ def capture_path() -> Path:
 
 def status_path() -> Path:
     return state_dir() / "keepwarm-status.json"
+
+
+def arm_path() -> Path:
+    return state_dir() / ARM_NAME
 
 
 def _write_json(path: Path, data: dict, mode: int = 0o600) -> None:
@@ -116,6 +126,7 @@ _capture_lock = threading.Lock()
 
 def pre_api_request(**kwargs):
     """Copy the outgoing request payload to disk. Returns None, never raises."""
+    poll_arm()
     try:
         payload = kwargs.get("request")
         if not isinstance(payload, dict) or not payload:
@@ -145,6 +156,7 @@ def pre_api_request(**kwargs):
 def post_api_request(**kwargs):
     """Observer for real turns. Keeps the last real activity time for the card."""
     global _last_real_turn_ts
+    poll_arm()
     try:
         _last_real_turn_ts = time.time()
     except Exception:
@@ -153,6 +165,72 @@ def post_api_request(**kwargs):
 
 
 _last_real_turn_ts = 0.0
+
+
+def arm(action: str, interval_s: float = DEFAULT_INTERVAL_S) -> bool:
+    """Write a start/stop request for the next hook to consume. Returns False on a bad verb.
+
+    This is the scriptable door into the loop: the daemon lives inside the process that
+    runs the hooks, so a slash command is not the only way in. ``action`` is ``start`` or
+    ``stop``.
+    """
+    verb = str(action or "").strip().lower()
+    if verb not in ("start", "stop"):
+        return False
+    try:
+        _write_json(arm_path(), {
+            "action": verb,
+            "interval_s": clamp_interval(interval_s),
+            "ts": time.time(),
+        })
+        return True
+    except Exception:
+        logger.debug("keepwarm: arm write failed", exc_info=True)
+        return False
+
+
+def poll_arm() -> str:
+    """Consume a pending arm file. Returns what was done: started, stopped, already, stale, or ''.
+
+    Called from both hooks. A file is consumed (deleted) even when it is stale or invalid,
+    so one bad write cannot be retried forever.
+    """
+    path = arm_path()
+    try:
+        if not path.exists():
+            return ""
+    except OSError:
+        return ""
+
+    record = _read_json(path)
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    if not isinstance(record, dict):
+        return ""
+
+    try:
+        stamp = float(record.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        stamp = 0.0
+    if abs(time.time() - stamp) > ARM_TTL_S:
+        return "stale"
+
+    action = str(record.get("action") or "").strip().lower()
+    try:
+        interval = clamp_interval(record.get("interval_s") or DEFAULT_INTERVAL_S)
+    except Exception:
+        interval = DEFAULT_INTERVAL_S
+
+    if action == "start":
+        if not capture_path().exists():
+            return "no-capture"
+        return "started" if start_loop(interval) else "already"
+    if action == "stop":
+        stop_loop("stopped by request")
+        return "stopped"
+    return ""
 
 
 def _chat_body(record: dict) -> dict:
