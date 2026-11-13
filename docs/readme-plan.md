@@ -10,7 +10,9 @@
 - Give each mod its output, commands, and limits so readers can use it without reading implementation code.
 - Use tables for row meanings, explorer keys, and fallback behavior so comparisons stay easy to scan.
 - Draw the hook, snapshot, widget, and replay paths so contributors can see the data contracts.
-- Report the measured 16 suites as 12 passed and 4 failed so verification reflects this sandbox run.
+- Report the measured suite count from a normal run, 16 of 16 passing.
+  The review sandbox could not write Hermes state or open localhost, so its own 12/16 is
+  an artefact of that sandbox, not the repository.
 - Explain active-home writes and localhost test servers because the existing root README's temp-only claim does not match the tests.
 - Link only existing repository paths because filetree-rail and keepwarm have no plugin README in this checkout.
 - Leave the root README and concurrent plugin edits untouched so this remains a reviewable documentation proposal.
