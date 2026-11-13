@@ -78,6 +78,7 @@ import logging
 import math
 import os
 import re
+import select
 import shutil
 import sqlite3
 import stat
@@ -505,16 +506,19 @@ def _resolve_cost(
 ) -> Tuple[float, str]:
     """``(cost_usd, cost_source)`` for one usage row.
 
-    Order: provider actual, provider estimate, then the local price table. A row with no
-    provider cost and no matching price yields ``(0.0, "none")`` instead of a silent $0.
+    Order: provider actual, provider estimate, then the local price table.
+
+    An ``actual`` number is a bill. An ``estimated`` number is the provider guessing from
+    its own rates, so it stays an estimate and keeps the ``~`` mark. Labelling both
+    ``provider`` printed an estimate as money already charged.
     """
-    for raw in (actual, estimated):
+    for raw, source in ((actual, "provider"), (estimated, "estimate")):
         try:
             value = float(raw or 0.0)
         except (TypeError, ValueError):
             continue
         if value > 0.0:
-            return value, "provider"
+            return value, source
 
     price = _match_price(model)
     if price is None:
@@ -562,10 +566,15 @@ def _read_totals(session_id: str) -> Optional[Dict[str, Any]]:
         if row_saved_source == "table":
             saved_source = "table"
 
-    if "provider" in sources:
+    if "provider" in sources and len(sources) == 1:
         cost_source = "provider"
     elif "table" in sources:
         cost_source = "table"
+    elif "estimate" in sources:
+        cost_source = "estimate"
+    elif "provider" in sources:
+        # Part of this total is billed and part is not. The sum is not a bill.
+        cost_source = "estimate"
     else:
         cost_source = "none"
 
@@ -1684,9 +1693,11 @@ def _combine_cost_sources(sources: Any) -> str:
     ``provider`` stays reserved for a number the provider actually billed. ``table`` and
     ``agent`` both mean "computed from rates", so a mixed total is an estimate.
     """
-    seen = {str(s) for s in sources if str(s) in ("provider", "table", "agent")}
+    seen = {str(s) for s in sources if str(s) in ("provider", "table", "agent", "estimate")}
     if "table" in seen:
         return "table"
+    if "estimate" in seen:
+        return "estimate"
     if "agent" in seen:
         return "agent"
     if "provider" in seen:
@@ -1886,19 +1897,48 @@ def _scan_dsh_file(path: Path, deadline: Optional[float] = None) -> Optional[Dic
         return None
 
     budget = AGENTS_SCAN_BUDGET_S if deadline is None else max(0.5, deadline - time.time())
+    # Two limits can bite: the budget for this file and the deadline for the whole scan.
+    stop_at = time.time() + budget
+    if deadline is not None:
+        stop_at = min(stop_at, deadline)
     try:
         with _ACTIVE_PROCS_LOCK:
             proc = subprocess.Popen([_ZSTD_BIN, "-dc", str(path)], stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL)
             _ACTIVE_PROCS.add(proc)
         try:
+            # Read in blocks so peak memory is the cap plus one block. Collecting all of
+            # stdout first and slicing afterwards does not bound the allocation a hostile
+            # frame can force.
+            blocks = []
+            total = 0
             try:
-                out, _err = proc.communicate(timeout=budget)
+                while True:
+                    if time.time() > stop_at:
+                        raise _ScanTimeout(f"decompress past the deadline: {path.name}")
+                    if proc.stdout is None:
+                        break
+                    # read() blocks until bytes arrive, so waiting on the pipe first is what
+                    # actually enforces the deadline against a stalled child.
+                    ready, _w, _x = select.select([proc.stdout], [], [],
+                                                  min(1.0, max(0.05, stop_at - time.time())))
+                    if not ready:
+                        continue
+                    block = proc.stdout.read(1 << 20)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > AGENT_MAX_DECOMPRESSED:
+                        proc.kill()
+                        proc.communicate(timeout=2)
+                        return None
+                    blocks.append(block)
+                proc.wait(timeout=max(2.0, stop_at - time.time() + 1.0))
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.communicate(timeout=2)
                 raise _ScanTimeout(f"decompress exceeded {budget:.1f}s: {path.name}")
-            raw = (out or b"")[:AGENT_MAX_DECOMPRESSED + 1]
+            raw = b"".join(blocks)
             code = proc.returncode
         finally:
             with _ACTIVE_PROCS_LOCK:
@@ -2127,7 +2167,7 @@ def _valid_agent_entry(entry: Any) -> bool:
         return False
     if not math.isfinite(float(cost)) or float(cost) < 0:
         return False
-    if entry.get("cost_source") not in ("provider", "table", "agent", "none"):
+    if entry.get("cost_source") not in ("provider", "table", "agent", "estimate", "none"):
         return False
     models = entry.get("models")
     if not isinstance(models, list):
@@ -2140,7 +2180,7 @@ def _valid_agent_entry(entry: Any) -> bool:
             return False
         if tokens < 0 or tokens > AGENT_MAX_TOKEN_TOTAL:
             return False
-        if model.get("cost_source") not in ("provider", "table", "agent", "none"):
+        if model.get("cost_source") not in ("provider", "table", "agent", "estimate", "none"):
             return False
     return True
 
@@ -2170,7 +2210,7 @@ def _valid_others_payload(value: Any) -> bool:
         return False
     if not math.isfinite(float(cost)) or float(cost) < 0:
         return False
-    if value["cost_source"] not in ("provider", "table", "agent", "none"):
+    if value["cost_source"] not in ("provider", "table", "agent", "estimate", "none"):
         return False
     return isinstance(value["unpriced"], bool)
 
@@ -2655,6 +2695,8 @@ def _cost_text(cost: Any, source: str) -> Tuple[str, str]:
     if source == "agent":
         # The agent computed this from its own rate table. That is an estimate, not a bill.
         return f"~{body}", "agent estimate"
+    if source == "estimate":
+        return f"~{body}", "provider estimate"
     return body, ""
 
 
@@ -2667,7 +2709,7 @@ def _rate_text(cost: Any, source: str) -> str:
     except (TypeError, ValueError):
         amount = 0.0
     body = f"${amount:.2f}/h"
-    return f"~{body}" if source in ("table", "agent") else body
+    return f"~{body}" if source in ("table", "agent", "estimate") else body
 
 
 def _age_text(seconds: float) -> str:
@@ -2886,12 +2928,12 @@ def render_card(payload: Dict[str, Any]) -> str:
     rule = RULE * (CARD_W - 2)
 
     saved_source = str(payload.get("cache_saved_source") or "none")
-    if saved_source not in ("provider", "table", "none"):
+    if saved_source not in ("provider", "table", "agent", "estimate", "none"):
         saved_source = "none"
     saved_value, saved_suffix = _cost_text(payload.get("cache_saved_usd"), saved_source)
 
     day_source = str(payload.get("day_source") or "none")
-    if day_source not in ("provider", "table", "none"):
+    if day_source not in ("provider", "table", "agent", "estimate", "none"):
         day_source = "none"
     day_value, _day_suffix = _cost_text(payload.get("day_cost_usd"), day_source)
     day_sessions = max(0, _int_value(payload.get("day_sessions")))

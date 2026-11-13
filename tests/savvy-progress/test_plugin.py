@@ -490,8 +490,8 @@ def main() -> int:
 
     check("actual cost wins when > 0",
           plugin._resolve_cost("deepseek-v4.1-flash", 1_000_000, 0, 0, 1.25, 9.0) == (1.25, "provider"))
-    check("estimated cost is used when actual is 0",
-          plugin._resolve_cost("deepseek-v4.1-flash", 1_000_000, 0, 0, 0.0, 0.3) == (0.3, "provider"))
+    check("a provider estimate stays an estimate, never a bill",
+          plugin._resolve_cost("deepseek-v4.1-flash", 1_000_000, 0, 0, 0.0, 0.3) == (0.3, "estimate"))
     table_cost, table_src = plugin._resolve_cost("deepseek-v4.1-flash", 1_000_000, 1_000_000, 1_000_000, 0, 0)
     # Hand check: 1M x 0.30/1e6 = 0.30, 1M x 1.20/1e6 = 1.20, 1M cache x 0.006/1e6 = 0.006;
     # sum 1.506. Cache tokens must take the cache rate, not the input rate.
@@ -528,8 +528,8 @@ def main() -> int:
           f"{t_table['cost_usd']} via {t_table['cost_source']}")
     check("_read_totals prefers actual_cost_usd",
           t_actual["cost_source"] == "provider" and t_actual["cost_usd"] == 0.125, f"{t_actual['cost_usd']}")
-    check("_read_totals falls back to estimated_cost_usd",
-          t_est["cost_source"] == "provider" and t_est["cost_usd"] == 0.0625, f"{t_est['cost_usd']}")
+    check("_read_totals falls back to estimated_cost_usd as an estimate",
+          t_est["cost_source"] == "estimate" and t_est["cost_usd"] == 0.0625, f"{t_est['cost_usd']}")
     check("_read_totals marks an unpriced session as none",
           t_none["cost_source"] == "none" and t_none["cost_usd"] == 0.0, f"{t_none['cost_usd']}")
     check("_read_totals still returns None for an unknown session", unknown is None)

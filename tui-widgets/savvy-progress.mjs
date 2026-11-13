@@ -80,7 +80,7 @@ const EMPTY = {
   ts: 0
 }
 
-const COST_SOURCES = new Set(['provider', 'table', 'agent', 'none'])
+const COST_SOURCES = new Set(['provider', 'table', 'agent', 'estimate', 'none'])
 
 /** Terminal cells, not codepoints. A CJK glyph is two cells wide, so a row padded by
  *  codepoint count overflows its declared width and the card reflows. */
@@ -165,7 +165,9 @@ export function formatCost(value, source) {
 
   const body = `$${Math.max(0, num(value)).toFixed(4)}`
 
-  return (source === 'table' || source === 'agent' ? `~${body}` : ` ${body}`).padStart(COST_W)
+  return (source === 'table' || source === 'agent' || source === 'estimate'
+    ? `~${body}`
+    : ` ${body}`).padStart(COST_W)
 }
 
 /** Agents row: the delegate count and their added cost, or `none`. Always 22 cells,
@@ -189,7 +191,7 @@ export function formatAgents(delegates) {
  *   `$n/a/h` when the session has no priced cost yet:
  *   `            ~$0.55/h`   `              $n/a/h` */
 export function formatBurn(value, source) {
-  if (source !== 'provider' && source !== 'table') {
+  if (source !== 'provider' && source !== 'table' && source !== 'estimate') {
     return '$n/a/h'.padStart(VALUE_W)
   }
 
