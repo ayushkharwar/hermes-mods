@@ -166,10 +166,22 @@ def main() -> int:
           "\n\n" not in hidden_card and "   \n" not in hidden_card,
           json.dumps(hidden_card)[:120])
 
+    cache_off = plugin.render_card({**CARD, "hidden_rows": ["cache"]})
+    check("hiding cache keeps the context row", "context" in cache_off, cache_off.replace("\n", " | ")[:120])
+    check("hiding cache drops the cache gauge", "◐" not in cache_off)
+
+    ctx_off = plugin.render_card({**CARD, "hidden_rows": ["ctx"]})
+    check("hiding ctx drops the context row", "context" not in ctx_off)
+
+    model_off = plugin.render_card({**CARD, "hidden_rows": ["model"]})
+    check("hiding model drops the model header", "deepseek-v4.1-flash" not in model_off,
+          model_off.splitlines()[0])
+
     tokens_off = plugin.render_card({**CARD, "hidden_rows": ["tokens"]})
     check("hiding tokens drops input/output/cache read at once",
           all(word not in tokens_off for word in ("input", "output", "cache read")))
     check("api calls survives hiding tokens", "api calls" in tokens_off)
+    check("hiding tokens keeps the context row", "context" in tokens_off)
 
     others_off = plugin.render_card({**CARD, "hidden_rows": ["others"]})
     check("hiding others drops the whole block", "other agents" not in others_off)
@@ -179,6 +191,27 @@ def main() -> int:
           everything.splitlines()[0])
     check("hiding every row prints no data row", "cost" not in everything
           and "today" not in everything, everything.replace("\n", " | ")[:160])
+
+    # 6b. A toggle republishes the snapshot, so an idle widget updates without a hook.
+    snapshot_file = base / "savvy-progress.json"
+    setattr(plugin, "_snapshot_path", lambda: snapshot_file)
+    plugin._last_payload = {**CARD, "hidden_rows": []}
+    plugin._cmd_progress("hide dsh")
+    published = json.loads(snapshot_file.read_text(encoding="utf-8"))
+    check("toggle publishes hidden_rows at once", published.get("hidden_rows") == ["dsh"],
+          str(published.get("hidden_rows")))
+    check("toggle keeps the card timestamp",
+          published.get("ts") == CARD["ts"], f"{published.get('ts')}")
+    plugin._cmd_progress("reset")
+
+    # 6c. A finished scan also republishes on its own.
+    plugin._last_payload = {**CARD, "others_tokens": 0}
+    plugin._republish_others({"agents": CARD["others"], "tokens": 2_004_028,
+                              "cost_usd": 0.85, "cost_source": "table",
+                              "unpriced": True, "ts": CARD["ts"]})
+    republished = json.loads(snapshot_file.read_text(encoding="utf-8"))
+    check("a finished scan publishes its own totals",
+          republished.get("others_tokens") == 2_004_028, str(republished.get("others_tokens")))
 
     # 7. The rows file the widget reads is written atomically and privately.
     plugin._write_hidden_rows(["dsh"])

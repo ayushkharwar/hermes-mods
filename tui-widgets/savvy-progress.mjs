@@ -80,7 +80,7 @@ const EMPTY = {
   ts: 0
 }
 
-const COST_SOURCES = new Set(['provider', 'table', 'none'])
+const COST_SOURCES = new Set(['provider', 'table', 'agent', 'none'])
 
 function num(value, fallback = 0) {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
@@ -110,7 +110,7 @@ export function formatCost(value, source) {
 
   const body = `$${Math.max(0, num(value)).toFixed(4)}`
 
-  return (source === 'table' ? `~${body}` : ` ${body}`).padStart(COST_W)
+  return (source === 'table' || source === 'agent' ? `~${body}` : ` ${body}`).padStart(COST_W)
 }
 
 /** Agents row: the delegate count and their added cost, or `none`. Always 22 cells,
@@ -140,7 +140,7 @@ export function formatBurn(value, source) {
 
   const body = `$${Math.max(0, num(value)).toFixed(2)}/h`
 
-  return (source === 'table' ? `~${body}` : ` ${body}`).padStart(VALUE_W)
+  return (source === 'table' || source === 'agent' ? `~${body}` : ` ${body}`).padStart(VALUE_W)
 }
 
 /** Saved row: dollars the cache avoided, 4 decimals like the cost row. */
@@ -371,7 +371,7 @@ export function buildRows(parts, snap, t) {
 
     return h(
       Box,
-      { flexDirection: 'row', key, width: ROW_W },
+      { flexDirection: 'row', key, rowKey: key, width: ROW_W },
       h(Text, { color: t.color.muted }, label.padEnd(LABEL_W)),
       h(Text, { color: tone }, pad)
     )
@@ -420,7 +420,7 @@ export function buildRows(parts, snap, t) {
   ]
   const hide = new Set(snap.hidden_rows || [])
 
-  return hide.size ? rows.filter(entry => !hide.has(entry.props.key)) : rows
+  return hide.size ? rows.filter(entry => !hide.has(entry.props.rowKey)) : rows
 }
 
 export default function register(sdk) {

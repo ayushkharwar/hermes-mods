@@ -165,12 +165,13 @@ def main() -> int:
           f"{pi_entry['tokens']} != {PI_TOKENS}")
     check("pi keeps the provider bill and the table estimate apart",
           abs(pi_entry["cost_usd"] - 0.55) < 1e-9, f"{pi_entry['cost_usd']}")
-    check("pi mixed cost is reported as an estimate", pi_entry["cost_source"] == "table",
-          pi_entry["cost_source"])
+    check("pi mixed cost is reported as an estimate",
+          pi_entry["cost_source"] in ("table", "agent"), pi_entry["cost_source"])
     check("pi local model marks the agent unpriced", pi_entry["unpriced"] is True)
     pi_models = {model["model"]: model for model in pi_entry["models"]}
-    check("provider-priced model keeps source=provider",
-          pi_models["paid-model"]["cost_source"] == "provider", json.dumps(pi_models["paid-model"]))
+    check("an agent-computed cost keeps source=agent, never provider",
+          pi_models["paid-model"]["cost_source"] == "agent",
+          json.dumps(pi_models["paid-model"]))
     check("table-priced model keeps list price",
           abs(pi_models["deepseek-v4.1-flash"]["cost_usd"] - 0.30) < 1e-9,
           f"{pi_models['deepseek-v4.1-flash']['cost_usd']}")
@@ -184,6 +185,36 @@ def main() -> int:
           dsh_entry["models"][0]["model"] == "deepseek-v4.1-flash", json.dumps(dsh_entry["models"][:1]))
     check("dsh cost is a table estimate", abs(dsh_entry["cost_usd"] - 0.30) < 1e-9
           and dsh_entry["cost_source"] == "table", f"{dsh_entry['cost_usd']} {dsh_entry['cost_source']}")
+
+    # 1b. Guards: negative and absurd counts are rejected, a symlink is not followed.
+    bad = base / "badpi"
+    write_jsonl(bad / "neg.jsonl", [
+        {"type": "message", "message": {"role": "assistant", "model": "deepseek-v4.1-flash",
+                                        "usage": {"input": -5, "output": 3, "cacheRead": 0,
+                                                  "cacheWrite": 0, "cost": {"total": 0}}}},
+        {"type": "message", "message": {"role": "assistant", "model": "deepseek-v4.1-flash",
+                                        "usage": {"input": 10 ** 15, "output": 0,
+                                                  "cacheRead": 0, "cacheWrite": 0,
+                                                  "cost": {"total": 0}}}},
+    ])
+    os.environ["SAVVY_PI_DIR"] = str(bad)
+    reset()
+    rejected = plugin._scan_others(now)
+    check("negative and absurd rows are dropped",
+          next(a for a in rejected["agents"] if a["name"] == "pi")["tokens"] == 0,
+          str(next(a for a in rejected["agents"] if a["name"] == "pi")["tokens"]))
+    os.environ["SAVVY_PI_DIR"] = str(pi)
+
+    link_root = base / "linkpi"
+    link_root.mkdir(exist_ok=True)
+    (link_root / "via-symlink.jsonl").symlink_to(pi / "--home-zen--" / "a.jsonl")
+    os.environ["SAVVY_PI_DIR"] = str(link_root)
+    reset()
+    linked = plugin._scan_others(now)
+    check("a symlinked transcript is not followed",
+          next(a for a in linked["agents"] if a["name"] == "pi")["tokens"] == 0,
+          str(next(a for a in linked["agents"] if a["name"] == "pi")["tokens"]))
+    os.environ["SAVVY_PI_DIR"] = str(pi)
 
     # 2. The combined total is the sum of the three agents.
     check("combined tokens are the sum of every agent",
@@ -234,6 +265,12 @@ def main() -> int:
     broken = plugin._others_totals(now, block=True)
     check("a corrupt cache file falls back to a live scan",
           broken["tokens"] == data["tokens"], f"{broken['tokens']}")
+
+    reset()
+    cache_file.write_text(json.dumps({"ts": now, "agents": []}), encoding="utf-8")
+    partial = plugin._others_totals(now, block=True)
+    check("a fresh cache missing fields is rejected and rescanned",
+          partial["tokens"] == data["tokens"], f"{partial.get('tokens')}")
 
     reset()
     cache_file.write_text(json.dumps({"ts": now - 600, "agents": [], "tokens": 1}), encoding="utf-8")

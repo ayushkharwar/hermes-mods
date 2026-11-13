@@ -32,7 +32,13 @@ function check(name, cond, detail = '') {
 const t = {
   color: { ok: 'ok', warn: 'warn', error: 'error', muted: 'muted', text: 'text', accent: 'accent' }
 }
-const h = (type, props, ...kids) => ({ type, props, kids })
+// React moves `key` off props onto the element. The stub does the same, so a filter that
+// reads props.key fails here exactly as it failed in the live TUI.
+const h = (type, props, ...kids) => {
+  const { key, ...rest } = props || {}
+
+  return { type, props: rest, kids, key }
+}
 const gauge = (ratio, width) => {
   const filled = Math.round(Math.min(1, Math.max(0, ratio)) * width)
   return '█'.repeat(filled) + '░'.repeat(width - filled)
@@ -49,13 +55,13 @@ function assertRows(name, snapshot, expectations = {}) {
   const rows = rowsOf(snapshot)
   check(`${name}: row count`, rows.length === 14, String(rows.length))
   for (const row of rows) {
-    const key = row.props?.key
+    const key = row.props?.rowKey
     const text = textOf(row)
     const width = [...text].length
     check(`${name}: ${key} width ${ROW_W}`, width === ROW_W, `got ${width} (${JSON.stringify(text)})`)
     check(`${name}: ${key} props width`, row.props?.width === ROW_W, String(row.props?.width))
   }
-  const byKey = Object.fromEntries(rows.map(r => [r.props.key, textOf(r).slice(LABEL_W)]))
+  const byKey = Object.fromEntries(rows.map(r => [r.props.rowKey, textOf(r).slice(LABEL_W)]))
   for (const [key, expected] of Object.entries(expectations)) {
     check(`${name}: ${key} shows ${JSON.stringify(expected)}`, byKey[key] === expected, JSON.stringify(byKey[key]))
   }
@@ -154,8 +160,8 @@ check('others: total row', r9.others.includes('226.8M'), JSON.stringify(r9.other
 const hiddenSet = buildRows(parts, { ...normal, hidden_rows: ['burn', 'saved', 'codex', 'pi', 'dsh'] }, t)
 check('hidden rows: five rows dropped', hiddenSet.length === 9, String(hiddenSet.length))
 check('hidden rows: no hidden key survives',
-  !hiddenSet.some(entry => ['burn', 'saved', 'codex', 'pi', 'dsh'].includes(entry.props.key)),
-  hiddenSet.map(entry => entry.props.key).join(','))
+  !hiddenSet.some(entry => ['burn', 'saved', 'codex', 'pi', 'dsh'].includes(entry.props.rowKey)),
+  hiddenSet.map(entry => entry.props.rowKey).join(','))
 check('hidden rows: the rest keep their width',
   hiddenSet.every(entry => [...textOf(entry)].length === ROW_W),
   hiddenSet.map(entry => [...textOf(entry)].length).join(','))

@@ -80,7 +80,9 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -1205,13 +1207,17 @@ def _write_json_atomic(path: Path, data: Any) -> bool:
 
     A failure leaves the previous file untouched, which the widget keeps polling.
     """
-    tmp = path.parent / (path.name + ".tmp")
+    tmp = None
     try:
         with _write_lock(path) as taken:
             if not taken:
                 return False
             path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            # mkstemp creates a brand-new file with O_EXCL and mode 0600. A fixed ".tmp"
+            # name let a planted symlink redirect a write outside the state directory.
+            fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".",
+                                            suffix=".tmp")
+            tmp = Path(tmp_name)
             try:
                 try:
                     text = json.dumps(data, indent=2, allow_nan=False)
@@ -1235,7 +1241,8 @@ def _write_json_atomic(path: Path, data: Any) -> bool:
     except Exception as exc:  # noqa: BLE001 — a write must never break a turn
         logger.debug("savvy-progress: write failed for %s: %s", path.name, exc)
         try:
-            os.unlink(tmp)
+            if tmp is not None:
+                os.unlink(tmp)
         except OSError:
             pass
         return False
@@ -1434,6 +1441,14 @@ AGENTS_CACHE_S = 60.0
 AGENTS_MAX_FILES = 4000
 AGENT_MODEL_ROWS = 3
 AGENTS_OFF_ENV = "SAVVY_AGENTS_OFF"
+# Bounds. A transcript is untrusted input: another agent wrote it, and a corrupt or hostile
+# one must not be able to stall a tool call or exhaust this process's memory.
+AGENT_MAX_FILE_BYTES = 64 * 1024 * 1024      # skip a file bigger than this outright
+AGENT_MAX_LINE_BYTES = 8 * 1024 * 1024       # one JSONL line; longer is corrupt
+AGENT_MAX_DECOMPRESSED = 256 * 1024 * 1024   # dsh cap; a zstd bomb stops here
+AGENTS_SCAN_BUDGET_S = 20.0                  # whole-scan wall clock
+AGENT_MAX_TOKENS = 10 ** 12                  # a single count above this is invalid
+AGENT_PAYLOAD_MODELS = 8                     # models published into the widget snapshot
 # (agent name, env override for its sessions root, default path under $HOME, file glob)
 AGENT_SOURCES: Tuple[Tuple[str, str, str, str], ...] = (
     ("codex", "SAVVY_CODEX_DIR", ".codex/sessions", "*.jsonl"),
@@ -1538,8 +1553,13 @@ def _write_hidden_rows(hidden: List[str]) -> bool:
     return ok
 
 
+
 def _toggle_rows(names: List[str], hide: bool) -> Optional[str]:
-    """``/svprogress hide|show <names>``. Returns a message, or None on a bad name."""
+    """``/svprogress hide|show <names>``. Returns a message, or None on a bad name.
+
+    The read-modify-write runs under its own lock, so two processes hiding different rows
+    cannot drop each other's change. A failed write is reported, never claimed as done.
+    """
     targets = []
     for name in names:
         key = _normalize_row(name)
@@ -1547,13 +1567,23 @@ def _toggle_rows(names: List[str], hide: bool) -> Optional[str]:
             return f"savvy-progress: unknown row '{name}'. Rows: " + ", ".join(ROW_KEYS)
         targets.append(key)
 
-    current = set(_hidden_rows())
-    if hide:
-        current.update(targets)
-    else:
-        current.difference_update(targets)
-    _write_hidden_rows(list(current))
+    path = _rows_path()
+    with _write_lock(path.parent / (path.name + ".update")) as taken:
+        if not taken:
+            return "savvy-progress: rows file is busy, try again"
+        _rows_cache["key"] = None
+        current = set(_hidden_rows())
+        if hide:
+            current.update(targets)
+        else:
+            current.difference_update(targets)
+        written = _write_hidden_rows(list(current))
 
+    if not written:
+        return "savvy-progress: rows not saved (state directory read-only?)"
+
+    ordered = [key for key in ROW_KEYS if key in current]
+    _republish(hidden_rows=ordered)
     state = "hidden" if hide else "shown"
     return f"savvy-progress: {state} {', '.join(targets)}"
 
@@ -1580,13 +1610,15 @@ def _blank_agent(name: str) -> Dict[str, Any]:
         "unpriced": False,
         "sessions": 0,
         "models": [],
+        "models_total": 0,
         "available": False,
+        "truncated": False,
     }
 
 
 def _agent_model() -> Dict[str, Any]:
     return {"tokens": 0, "input": 0, "cache_read": 0, "output": 0,
-            "cost_usd": 0.0, "cost_source": "none", "calls": 0}
+            "cost_usd": 0.0, "cost_source": "none", "calls": 0, "unpriced": False}
 
 
 def _agent_cost(model: str, fresh_in: int, cache_read: int, tokens_out: int,
@@ -1598,7 +1630,9 @@ def _agent_cost(model: str, fresh_in: int, cache_read: int, tokens_out: int,
     fresh input: the estimate stays conservative and, unlike an invented rate, checkable.
     """
     if reported > 0.0:
-        return reported, "provider"
+        # pi computes this from a rate table. It is an estimate, not a bill, so it keeps
+        # its own source and is drawn with the estimate mark.
+        return reported, "agent"
 
     price = _match_price(model) if model else None
     if price is None:
@@ -1614,26 +1648,86 @@ def _agent_cost(model: str, fresh_in: int, cache_read: int, tokens_out: int,
 
 
 def _combine_cost_sources(sources: Any) -> str:
-    """One source for a mixed set of rows. Any estimate makes the total an estimate."""
-    seen = {str(s) for s in sources if str(s) in ("provider", "table")}
+    """One source for a mixed set of rows. Any estimate makes the total an estimate.
+
+    ``provider`` stays reserved for a number the provider actually billed. ``table`` and
+    ``agent`` both mean "computed from rates", so a mixed total is an estimate.
+    """
+    seen = {str(s) for s in sources if str(s) in ("provider", "table", "agent")}
     if "table" in seen:
         return "table"
+    if "agent" in seen:
+        return "agent"
     if "provider" in seen:
         return "provider"
     return "none"
 
 
 def _iter_lines(path: Path) -> Iterator[str]:
+    """Lines of a transcript. An oversized line is corrupt or hostile, so it is skipped."""
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            if line.strip():
-                yield line
+            if not line.strip():
+                continue
+            if len(line) > AGENT_MAX_LINE_BYTES:
+                continue
+            yield line
+
+
+def _add_codex_usage(models: Dict[str, Dict[str, Any]], model: str,
+                      usage: Dict[str, Any]) -> bool:
+    """Add one response of codex usage to ``model``. False when the row is not plausible."""
+    gross = _int_value(usage.get("input_tokens"))
+    cached = _int_value(usage.get("cached_input_tokens"))
+    tokens_out = _int_value(usage.get("output_tokens"))
+    total = _int_value(usage.get("total_tokens"))
+
+    if min(gross, cached, tokens_out, total) < 0:
+        return False
+    if max(gross, cached, tokens_out, total) > AGENT_MAX_TOKENS:
+        return False
+
+    cached = min(gross, cached)
+    fresh_in = gross - cached
+    cost, source = _agent_cost(model, fresh_in, cached, tokens_out)
+
+    row = models.setdefault(model or "unknown", _agent_model())
+    row["tokens"] += total or (gross + tokens_out)
+    row["input"] += fresh_in
+    row["cache_read"] += cached
+    row["output"] += tokens_out
+    row["cost_usd"] += cost
+    row["calls"] += 1
+    row["cost_source"] = _combine_cost_sources([row["cost_source"], source])
+    row["unpriced"] = bool(row["unpriced"]) or source == "none"
+    return True
+
+
+def _sum_models(models: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """One tally from a ``{model: row}`` map: the totals for that file."""
+    tally = _agent_model()
+    for row in models.values():
+        for key in ("tokens", "input", "cache_read", "output", "calls"):
+            tally[key] += row[key]
+        tally["cost_usd"] += row["cost_usd"]
+        tally["cost_source"] = _combine_cost_sources([tally["cost_source"], row["cost_source"]])
+        tally["unpriced"] = bool(tally["unpriced"]) or bool(row["unpriced"])
+    return tally
 
 
 def _scan_codex_file(path: Path) -> Optional[Dict[str, Any]]:
-    """One codex rollout. ``token_count`` carries the session's running total."""
-    usage: Optional[Dict[str, Any]] = None
-    model = ""
+    """One codex rollout, attributed per response.
+
+    ``token_count`` events carry ``last_token_usage``: the usage of that one response, with
+    the model active at that moment. Summing those keeps a model switch from moving earlier
+    spend onto the last model. A rollout without the delta (an old build) falls back to the
+    cumulative total on the last model.
+    """
+    models: Dict[str, Dict[str, Any]] = {}
+    current = ""
+    cumulative: Optional[Dict[str, Any]] = None
+    deltas = False
+
     try:
         for line in _iter_lines(path):
             if '"token_count"' in line:
@@ -1643,30 +1737,30 @@ def _scan_codex_file(path: Path) -> Optional[Dict[str, Any]]:
                     continue
                 payload = event.get("payload") if isinstance(event, dict) else None
                 info = payload.get("info") if isinstance(payload, dict) else None
-                totals = info.get("total_token_usage") if isinstance(info, dict) else None
-                if isinstance(totals, dict):
-                    usage = totals
+                if not isinstance(info, dict):
+                    continue
+                total = info.get("total_token_usage")
+                if isinstance(total, dict):
+                    cumulative = total
+                last = info.get("last_token_usage")
+                if isinstance(last, dict) and _add_codex_usage(models, current, last):
+                    deltas = True
             elif '"model"' in line:
                 match = _MODEL_KEY_RE.search(line)
                 if match:
-                    model = match.group(1).strip()
+                    current = match.group(1).strip()
     except OSError:
         return None
 
-    if not usage:
+    if not deltas:
+        if not isinstance(cumulative, dict):
+            return None
+        if not _add_codex_usage(models, current, cumulative):
+            return None
+
+    if not models:
         return None
-
-    gross_in = max(0, _int_value(usage.get("input_tokens")))
-    cache_read = min(gross_in, max(0, _int_value(usage.get("cached_input_tokens"))))
-    fresh_in = max(0, gross_in - cache_read)
-    tokens_out = max(0, _int_value(usage.get("output_tokens")))
-    total = max(0, _int_value(usage.get("total_tokens"))) or (gross_in + tokens_out)
-    cost, source = _agent_cost(model, fresh_in, cache_read, tokens_out)
-
-    row = _agent_model()
-    row.update({"tokens": total, "input": fresh_in, "cache_read": cache_read,
-                "output": tokens_out, "cost_usd": cost, "cost_source": source, "calls": 1})
-    return {"tally": row, "models": {model or "unknown": row}}
+    return {"tally": _sum_models(models), "models": models}
 
 
 def _scan_pi_file(path: Path) -> Optional[Dict[str, Any]]:
@@ -1687,11 +1781,18 @@ def _scan_pi_file(path: Path) -> Optional[Dict[str, Any]]:
 
             outer = entry if isinstance(entry, dict) else {}
             model = str(message.get("model") or outer.get("model") or "unknown")
-            fresh_in = max(0, _int_value(usage.get("input")))
-            cache_read = max(0, _int_value(usage.get("cacheRead")))
+            fresh_in = _int_value(usage.get("input"))
+            cache_read = _int_value(usage.get("cacheRead"))
+            cache_write = _int_value(usage.get("cacheWrite"))
+            tokens_out = _int_value(usage.get("output"))
+
+            if min(fresh_in, cache_read, cache_write, tokens_out) < 0:
+                continue
+            if max(fresh_in, cache_read, cache_write, tokens_out) > AGENT_MAX_TOKENS:
+                continue
+
             # No cache-write rate exists in the table, so a write is priced as input.
-            fresh_in += max(0, _int_value(usage.get("cacheWrite")))
-            tokens_out = max(0, _int_value(usage.get("output")))
+            fresh_in += cache_write
             reported = usage.get("cost") if isinstance(usage.get("cost"), dict) else {}
             cost, source = _agent_cost(model, fresh_in, cache_read, tokens_out,
                                        _finite(reported.get("total")))
@@ -1704,56 +1805,49 @@ def _scan_pi_file(path: Path) -> Optional[Dict[str, Any]]:
             row["cost_usd"] += cost
             row["calls"] += 1
             row["cost_source"] = _combine_cost_sources([row["cost_source"], source])
+            row["unpriced"] = bool(row["unpriced"]) or source == "none"
     except OSError:
         return None
 
     if not models:
         return None
-
-    tally = _agent_model()
-    for row in models.values():
-        for key in ("tokens", "input", "cache_read", "output", "calls"):
-            tally[key] += row[key]
-        tally["cost_usd"] += row["cost_usd"]
-        tally["cost_source"] = _combine_cost_sources([tally["cost_source"], row["cost_source"]])
-    return {"tally": tally, "models": models}
+    return {"tally": _sum_models(models), "models": models}
 
 
 def _scan_dsh_file(path: Path) -> Optional[Dict[str, Any]]:
     """One dsh session, decompressed with the ``zstd`` binary.
 
-    The usage chunk carries input, output and cache-read tokens but no cost, so dsh cost
-    is always a table estimate. No ``zstd`` binary means no dsh numbers, never a guess.
+    The usage chunk carries input, output and cache-read tokens but no cost, so dsh cost is
+    always a table estimate. Output is read with a hard byte ceiling: a compression bomb
+    stops at the cap instead of filling memory. No ``zstd`` binary means no dsh numbers.
     """
     if not _ZSTD_BIN:
         return None
 
     try:
-        proc = subprocess.run(
-            [_ZSTD_BIN, "-dc", str(path)],
-            capture_output=True,
-            timeout=20,
-            check=False,
-        )
+        with subprocess.Popen([_ZSTD_BIN, "-dc", str(path)], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL) as proc:
+            raw = proc.stdout.read(AGENT_MAX_DECOMPRESSED + 1) if proc.stdout else b""
+            proc.kill()
     except (OSError, subprocess.SubprocessError):
         return None
-    if proc.returncode != 0:
+    if len(raw) > AGENT_MAX_DECOMPRESSED:
         return None
 
     models: Dict[str, Dict[str, Any]] = {}
     model = ""
-    for raw in proc.stdout.decode("utf-8", "replace").splitlines():
-        if not raw.strip():
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if not line.strip():
             continue
-        if '"source"' in raw and '"model"' in raw:
-            match = _MODEL_KEY_RE.search(raw)
+        if '"source"' in line and '"model"' in line:
+            match = _MODEL_KEY_RE.search(line)
             if match:
                 model = match.group(1).strip()
             continue
-        if '"usage"' not in raw:
+        if '"usage"' not in line:
             continue
         try:
-            event = json.loads(raw)
+            event = json.loads(line)
         except ValueError:
             continue
         chunk = (event.get("data") or {}).get("chunk") if isinstance(event, dict) else None
@@ -1763,32 +1857,31 @@ def _scan_dsh_file(path: Path) -> Optional[Dict[str, Any]]:
         if not isinstance(usage, dict):
             continue
 
-        fresh_in = max(0, _int_value(usage.get("inputTokens")))
-        cache_read = max(0, _int_value(usage.get("cacheReadTokens")))
-        tokens_out = max(0, _int_value(usage.get("outputTokens")))
+        fresh_in = _int_value(usage.get("inputTokens"))
+        cache_read = _int_value(usage.get("cacheReadTokens"))
+        tokens_out = _int_value(usage.get("outputTokens"))
+        total = _int_value(usage.get("totalTokens"))
+
+        if min(fresh_in, cache_read, tokens_out, total) < 0:
+            continue
+        if max(fresh_in, cache_read, tokens_out, total) > AGENT_MAX_TOKENS:
+            continue
+
         cost, source = _agent_cost(model, fresh_in, cache_read, tokens_out)
 
         row = models.setdefault(model or "unknown", _agent_model())
-        row["tokens"] += max(0, _int_value(usage.get("totalTokens"))) or (
-            fresh_in + cache_read + tokens_out
-        )
+        row["tokens"] += total or (fresh_in + cache_read + tokens_out)
         row["input"] += fresh_in
         row["cache_read"] += cache_read
         row["output"] += tokens_out
         row["cost_usd"] += cost
         row["calls"] += 1
         row["cost_source"] = _combine_cost_sources([row["cost_source"], source])
+        row["unpriced"] = bool(row["unpriced"]) or source == "none"
 
     if not models:
         return None
-
-    tally = _agent_model()
-    for row in models.values():
-        for key in ("tokens", "input", "cache_read", "output", "calls"):
-            tally[key] += row[key]
-        tally["cost_usd"] += row["cost_usd"]
-        tally["cost_source"] = _combine_cost_sources([tally["cost_source"], row["cost_source"]])
-    return {"tally": tally, "models": models}
+    return {"tally": _sum_models(models), "models": models}
 
 
 _SCANNERS = {"codex": _scan_codex_file, "pi": _scan_pi_file, "dsh": _scan_dsh_file}
@@ -1801,26 +1894,64 @@ def _agent_root(env_name: str, rel: str) -> Path:
     return Path(os.path.expanduser("~")) / rel
 
 
-def _agent_files(root: Path, glob: str) -> List[Path]:
+def _agent_files(root: Path, glob: str) -> Tuple[List[Path], bool]:
+    """Newest first, regular files only, capped. Returns ``(files, truncated)``.
+
+    A symlink, FIFO or device under a session root is skipped: a FIFO would block the scan
+    forever and a symlink can point at anything this user can read. Hard links to the same
+    inode are counted once, so a linked transcript cannot double the spend.
+    """
     if not root.is_dir():
-        return []
+        return [], False
+
+    found: List[Tuple[float, Path]] = []
+    seen: set = set()
     try:
-        return sorted(root.rglob(glob))[:AGENTS_MAX_FILES]
+        for path in root.rglob(glob):
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            if info.st_size > AGENT_MAX_FILE_BYTES:
+                continue
+            identity = (info.st_dev, info.st_ino)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            found.append((info.st_mtime, path))
     except OSError:
-        return []
+        return [], False
+
+    found.sort(key=lambda item: item[0], reverse=True)
+    truncated = len(found) > AGENTS_MAX_FILES
+    return [path for _mtime, path in found[:AGENTS_MAX_FILES]], truncated
 
 
-def _scan_agent(name: str, env_name: str, rel: str, glob: str) -> Dict[str, Any]:
-    """Totals for one agent. Never raises: a bad tree yields an empty, honest entry."""
+def _scan_agent(name: str, env_name: str, rel: str, glob: str,
+                deadline: Optional[float] = None,
+                previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Totals for one agent. Never raises: a bad tree yields an empty, honest entry.
+
+    ``deadline`` bounds the whole scan. When it passes, the agent is marked truncated and
+    the numbers cover only the files read so far. ``previous`` keeps the last good numbers
+    when a tree that read fine reads empty now, so a transient permission error cannot wipe
+    the card.
+    """
     entry = _blank_agent(name)
     scanner = _SCANNERS.get(name)
-    files = _agent_files(_agent_root(env_name, rel), glob)
+    files, truncated = _agent_files(_agent_root(env_name, rel), glob)
+    entry["truncated"] = truncated
     if not scanner or not files or (name == "dsh" and not _ZSTD_BIN):
         return entry
 
     entry["available"] = True
     models: Dict[str, Dict[str, Any]] = {}
     for path in files:
+        if deadline is not None and time.time() > deadline:
+            entry["truncated"] = True
+            break
         try:
             parsed = scanner(path)
         except Exception as exc:  # noqa: BLE001 — one bad transcript is not the whole agent
@@ -1841,15 +1972,25 @@ def _scan_agent(name: str, env_name: str, rel: str, glob: str) -> Dict[str, Any]
             merged["cost_source"] = _combine_cost_sources(
                 [merged["cost_source"], row["cost_source"]]
             )
+            merged["unpriced"] = bool(merged["unpriced"]) or bool(row["unpriced"])
+
+    if not models and not entry["sessions"] and isinstance(previous, dict) and previous.get("tokens"):
+        # Same tree, previously readable, nothing readable now: keep the last good numbers.
+        kept = dict(previous)
+        kept["truncated"] = True
+        return kept
 
     entry["cost_usd"] = round(entry["cost_usd"], 6)
-    entry["unpriced"] = any(row["cost_source"] == "none" for row in models.values())
+    entry["unpriced"] = any(bool(row["unpriced"]) for row in models.values())
     entry["cost_source"] = _combine_cost_sources(
         row["cost_source"] for row in models.values()
     )
+    ordered = sorted(models.items(), key=lambda kv: -kv[1]["tokens"])
+    entry["models_total"] = len(ordered)
+    # The widget snapshot carries only the models it can show. Full detail stays in the
+    # agents cache, so a 40-model history cannot bloat every poll.
     entry["models"] = [
-        {"model": model, **{k: v for k, v in row.items()}}
-        for model, row in sorted(models.items(), key=lambda kv: -kv[1]["tokens"])
+        {"model": model, **row} for model, row in ordered[:AGENT_PAYLOAD_MODELS]
     ]
     return entry
 
@@ -1867,8 +2008,15 @@ def _others_payload(agents: List[Dict[str, Any]], now: float) -> Dict[str, Any]:
 
 
 def _scan_others(now: float) -> Dict[str, Any]:
+    deadline = now + AGENTS_SCAN_BUDGET_S
+    previous = {}
+    cached = _others_cache.get("value")
+    if isinstance(cached, dict) and isinstance(cached.get("agents"), list):
+        previous = {a.get("name"): a for a in cached["agents"] if isinstance(a, dict)}
     return _others_payload(
-        [_scan_agent(name, env_name, rel, glob) for name, env_name, rel, glob in AGENT_SOURCES],
+        [_scan_agent(name, env_name, rel, glob, deadline=deadline,
+                     previous=previous.get(name))
+         for name, env_name, rel, glob in AGENT_SOURCES],
         now,
     )
 
@@ -1877,13 +2025,42 @@ def _others_path() -> Path:
     return _hermes_home() / "state" / AGENTS_CACHE_NAME
 
 
+_OTHERS_FIELDS = ("ts", "agents", "tokens", "cost_usd", "cost_source", "unpriced")
+
+
+def _valid_others_payload(value: Any) -> bool:
+    """True when ``value`` has every field the snapshot and the card read from it.
+
+    A cache with a missing key used to pass the age check and then abort snapshot
+    construction, which silently froze the whole card. Validate the shape instead.
+    """
+    if not isinstance(value, dict):
+        return False
+    if any(field not in value for field in _OTHERS_FIELDS):
+        return False
+    if not isinstance(value["agents"], list):
+        return False
+    tokens = value["tokens"]
+    if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
+        return False
+    if not isinstance(value["cost_usd"], (int, float)) or isinstance(value["cost_usd"], bool):
+        return False
+    if value["cost_source"] not in ("provider", "table", "agent", "none"):
+        return False
+    if not isinstance(value["unpriced"], bool):
+        return False
+    return True
+
+
 def _read_others_cache(now: float) -> Optional[Dict[str, Any]]:
     try:
         raw = json.loads(_others_path().read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return None
-    if not isinstance(raw, dict) or not isinstance(raw.get("agents"), list):
+    if not _valid_others_payload(raw):
         return None
+    # The payload's own timestamp decides freshness. Re-stamping on load let a 118-second
+    # old cache pass a 60-second window.
     age = now - _finite(raw.get("ts"))
     if not (0.0 <= age < AGENTS_CACHE_S):
         return None
@@ -1893,11 +2070,10 @@ def _read_others_cache(now: float) -> Optional[Dict[str, Any]]:
 def _others_totals(now: Optional[float] = None, block: bool = False) -> Dict[str, Any]:
     """Cross-agent totals.
 
-    ``block=False`` is the hook path: it never waits for a scan. The card can not afford a
-    cold ``~0.6 s`` read of every sibling transcript on the first tool call, so a stale or
-    missing cache returns the previous numbers and one background thread refreshes them
-    (single-flight; a second caller returns at once). ``block=True`` is the slash-command
-    path, where the user is waiting for a printout anyway.
+    ``block=False`` is the hook path: it never waits for a scan, returns the last known
+    numbers and lets one background thread refresh them. ``block=True`` is the slash path,
+    where the user waits for a printout. Both paths share one flight guard, so a command
+    cannot start a second scan beside the running one.
 
     ``SAVVY_AGENTS_OFF=1`` disables the scan entirely.
     """
@@ -1909,20 +2085,35 @@ def _others_totals(now: Optional[float] = None, block: bool = False) -> Dict[str
         return _others_payload([_blank_agent(name) for name, *_rest in AGENT_SOURCES], now)
 
     cached = _others_cache.get("value")
-    if isinstance(cached, dict) and 0.0 <= now - float(_others_cache.get("ts") or 0.0) < AGENTS_CACHE_S:
-        return cached
+    if isinstance(cached, dict):
+        age = now - _finite(cached.get("ts"))
+        if 0.0 <= age < AGENTS_CACHE_S:
+            return cached
 
     value = _read_others_cache(now)
     if value is not None:
-        _others_cache["ts"] = now
         _others_cache["value"] = value
         return value
 
     if block:
-        value = _refresh_others(now)
-        if value is not None:
-            return value
-        return _others_payload([_blank_agent(name) for name, *_rest in AGENT_SOURCES], now)
+        with _others_lock:
+            waiting = _others_refreshing
+            if not waiting:
+                _others_refreshing = True
+        if waiting:
+            deadline = time.time() + AGENTS_SCAN_BUDGET_S
+            while time.time() < deadline:
+                with _others_lock:
+                    if not _others_refreshing:
+                        break
+                time.sleep(0.02)
+            return _stale_others(now)
+        try:
+            scanned = _refresh_others(now)
+        finally:
+            with _others_lock:
+                _others_refreshing = False
+        return scanned if scanned is not None else _stale_others(now)
 
     with _others_lock:
         if _others_refreshing:
@@ -1941,6 +2132,35 @@ def _stale_others(now: float) -> Dict[str, Any]:
     if isinstance(cached, dict):
         return cached
     return _others_payload([_blank_agent(name) for name, *_rest in AGENT_SOURCES], now)
+
+
+_last_payload: Optional[Dict[str, Any]] = None
+
+
+def _republish(**changes: Any) -> bool:
+    """Rewrite the snapshot with a few replaced fields, so the widget sees them at once.
+
+    The card keeps its own ``ts``: this is a content refresh, not a new usage sample, and a
+    fresh timestamp over an old session would hide staleness behind live sibling numbers.
+    """
+    payload = _last_payload
+    if not isinstance(payload, dict) or not payload:
+        return False
+    merged = dict(payload)
+    merged.update(changes)
+    return _write_json_atomic(_snapshot_path(), merged)
+
+
+def _republish_others(value: Dict[str, Any]) -> bool:
+    """Push one finished scan into the snapshot without waiting for another hook."""
+    return _republish(
+        others=value.get("agents") or [],
+        others_tokens=_int_value(value.get("tokens")),
+        others_cost_usd=_finite(value.get("cost_usd")),
+        others_source=value.get("cost_source") or "none",
+        others_unpriced=bool(value.get("unpriced")),
+        others_ts=_finite(value.get("ts")),
+    )
 
 
 def _refresh_others(now: float) -> Optional[Dict[str, Any]]:
@@ -1964,7 +2184,9 @@ def _background_scan() -> None:
     global _others_refreshing
 
     try:
-        _refresh_others(time.time())
+        value = _refresh_others(time.time())
+        if isinstance(value, dict):
+            _republish_others(value)
     finally:
         with _others_lock:
             _others_refreshing = False
@@ -2116,6 +2338,9 @@ def _build_snapshot(
         # Rows the user switched off. The widget drops them; the card skips their lines.
         "hidden_rows": _hidden_rows(),
     }
+    global _last_payload
+    _last_payload = payload
+
     new_entry = {
         "turn": turn,
         "turns": turns,
@@ -2288,6 +2513,9 @@ def _cost_text(cost: Any, source: str) -> Tuple[str, str]:
     body = f"${amount:.4f}"
     if source == "table":
         return f"~{body}", "list price"
+    if source == "agent":
+        # The agent computed this from its own rate table. That is an estimate, not a bill.
+        return f"~{body}", "agent estimate"
     return body, ""
 
 
@@ -2300,7 +2528,7 @@ def _rate_text(cost: Any, source: str) -> str:
     except (TypeError, ValueError):
         amount = 0.0
     body = f"${amount:.2f}/h"
-    return f"~{body}" if source == "table" else body
+    return f"~{body}" if source in ("table", "agent") else body
 
 
 def _age_text(seconds: float) -> str:
@@ -2357,8 +2585,13 @@ def _compact_tokens(value: Any) -> str:
 
 
 def _agent_cell(value: Any, width: int) -> str:
-    """One fixed card cell: a string cut to ``width`` with a single-cell ellipsis."""
-    body = str(value if value is not None else "")
+    """One fixed card cell: a string cut to ``width`` with a single-cell ellipsis.
+
+    Control characters are removed first. A model name comes from another agent's
+    transcript, so a newline in it could otherwise forge an extra line on the card.
+    """
+    body = "".join(ch for ch in str(value if value is not None else "")
+                   if ch >= " " and ch != "\x7f")
     if len(body) > width:
         return body[: max(1, width - 1)] + "…"
     return body.ljust(width)
@@ -2414,7 +2647,11 @@ def _others_lines(payload: Dict[str, Any], hidden: Any = None) -> List[str]:
         return []
 
     lines: List[str] = []
+    contributors = 0
     reachable = 0
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("available"):
+            contributors += 1
     for entry in entries:
         if not isinstance(entry, dict) or not entry.get("available"):
             continue
@@ -2428,7 +2665,8 @@ def _others_lines(payload: Dict[str, Any], hidden: Any = None) -> List[str]:
         models = [m for m in (entry.get("models") or []) if isinstance(m, dict)]
         lines.append(
             _agent_row(str(entry.get("name") or "?"),
-                       f"{len(models)} model{'s' if len(models) != 1 else ''}",
+                       f"{_int_value(entry.get('models_total')) or len(models)} "
+                       f"model{'s' if (_int_value(entry.get('models_total')) or len(models)) != 1 else ''}",
                        entry.get("tokens"), entry.get("cost_usd"), source, unpriced)
         )
 
@@ -2453,7 +2691,9 @@ def _others_lines(payload: Dict[str, Any], hidden: Any = None) -> List[str]:
     if source not in ("provider", "table", "none"):
         source = "none"
     lines.append(
-        _agent_row(f"total {reachable}", "all models", payload.get("others_tokens"),
+        # The amount sums every available agent, so the label counts every contributor,
+        # not only the rows still visible.
+        _agent_row(f"total {contributors}", "all models", payload.get("others_tokens"),
                    payload.get("others_cost_usd"), source, bool(payload.get("others_unpriced")))
     )
     return lines
@@ -2546,12 +2786,14 @@ def render_card(payload: Dict[str, Any]) -> str:
     if shown("api"):
         body.append(_row("api calls", _thousands(payload.get("api_calls"))))
     if shown("tokens"):
+        # The cache gauge lives inside the input row, so `cache` controls only that marker.
+        marker = f"   ◐ {f'{hit:.1f}%'.rjust(5)}" if shown("cache") else ""
         body.extend([
-            _row("input", _thousands(tokens_in), f"   ◐ {f'{hit:.1f}%'.rjust(5)}"),
+            _row("input", _thousands(tokens_in), marker),
             _row("output", _thousands(payload.get("output_tokens"))),
             _row("cache read", _thousands(cache_read)),
         ])
-    if shown("tokens", "cache"):
+    if shown("ctx"):
         body.append(context_row)
     if shown("cost"):
         body.append(_row("cost", cost_value, suffix))
@@ -2568,7 +2810,8 @@ def render_card(payload: Dict[str, Any]) -> str:
     if others_block:
         body.extend(others_block)
 
-    lines = [_header(payload.get("model"), payload.get("provider")), rule]
+    header_model = payload.get("model") if shown("model") else ""
+    lines = [_header(header_model, payload.get("provider")), rule]
     lines.extend(body)
     lines.append(rule)
 
