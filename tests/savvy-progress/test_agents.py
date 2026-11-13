@@ -49,7 +49,7 @@ def load_plugin():
 # Every number below is asserted further down, so the expectation is a hand total, not a
 # copy of whatever the code happens to return.
 CODEX_LINES = [
-    {"type": "turn_context", "payload": {"model": "gpt-6.1-terra"}},
+    {"type": "turn_context", "payload": {"model": "gpt-9-unpriced"}},
     {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {
         "input_tokens": 1000, "cached_input_tokens": 400,
         "output_tokens": 100, "total_tokens": 1100}}}},
@@ -153,7 +153,7 @@ def main() -> int:
     check("codex cached input is not double counted",
           codex_entry["input"] == 2000 and codex_entry["cache_read"] == 1000,
           f"in={codex_entry['input']} cached={codex_entry['cache_read']}")
-    check("codex model name is read from the rollout", codex_entry["models"][0]["model"] == "gpt-6.1-terra",
+    check("codex model name is read from the rollout", codex_entry["models"][0]["model"] == "gpt-9-unpriced",
           json.dumps(codex_entry["models"][:1]))
     check("an unpriced codex model reports $n/a, not $0",
           codex_entry["cost_usd"] == 0.0 and codex_entry["cost_source"] == "none",

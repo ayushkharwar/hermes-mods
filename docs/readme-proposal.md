@@ -13,40 +13,78 @@ Rendered from the [golden session fixture](tests/savvy-progress/golden_single_se
 ```text
 PROGRESS
 model   deepseek-v4.1-flash
-tokens             12.0k / 900
-cache       █████░░░░░░░ 40.0%
-ctx         ░░░░░░░░░░░░  0.0%
-cost                  ~$0.0047
+tokens         242.9k / 104.9k
+cache       ████████████ 98.7%
+ctx         ██░░░░░░░░░░ 13.3%
+cost                  ~$0.3074
+burn                  ~$0.55/h
+saved                 ~$5.3245
+today       ~$1.4790  24 chats
+tok/day                  85.0M
+codex               $n/a 24.1M
+pi            ~$1.6343? 111.3M
+dsh            ~$3.0715? 93.8M
+others        ~$4.7058? 229.3M
 agents                    none
 ```
 
-**The same fixture through `/svprogress`**
+Copied from a live card.
+`$n/a` means no price exists for that model.
+`?` means part of that total is unpriced and left out of the money.
+
+**The same card through `/svprogress`**, abridged after the rows:
 
 ```text
 PROGRESS  deepseek-v4.1-flash  custom
 ────────────────────────────────────────
-  primary       golden-A  0 agents
-  api calls                9
-  input               12,000   ◐ 40.0%
-  output                 900
-  cache read           8,000
-  context             0/1.0M    0.0%
-  cost              ~$0.0047   list price
-  agents                none
-────────────────────────────────────────
-  ▸ last 2 turns
-    1  in    3,000  out    300  ~$0.0013
-    2  in    8,000  out    500  ~$0.0030
+  primary       d4d9e9539f70  12 agents
+  api calls               99
+  input              145,960   ◐ 98.1%
+  output              73,154
+  cache read       7,741,696
+  context         92.7k/1.0M    9.3%
+  cost              ~$0.3543   list price
+  burn/hour         ~$0.56/h
+  cache saved       ~$2.2761   list price
+  today             ~$1.4882   24 chats
+  tokens/day      85,534,200
+  agents                  12   +~$0.1763
+  codex   4 models         24.1M      $n/a
+          · gpt-6.1-sol    14.2M      $n/a
+  pi      15 models       111.3M ~$1.6343?
+          · DeepSeek-V4.1… 89.1M  ~$1.4203
+  dsh     3 models         93.8M ~$3.0715?
+  total 3 all models      229.3M ~$4.7058?
+════════════════════════════════════════
+        (12 turn lines and the stale note follow)
 ```
+
+This machine has real codex, pi and dsh history, so those rows carry real numbers.
 
 **A real verifier result**
 
 ```text
+PASS  savvy-progress plugin
 PASS  savvy-progress widget
+PASS  savvy-progress integration
+PASS  savvy-progress hardening
+PASS  savvy-progress agents
+PASS  savvy-progress rows
+PASS  savvy-progress concurrency
+PASS  savvy-progress soak
+PASS  filetree-rail plugin
+PASS  filetree-rail widget
+PASS  keepwarm capture
+PASS  keepwarm ping
+PASS  keepwarm stop
+PASS  keepwarm truncated
+PASS  keepwarm fallback
+PASS  keepwarm arm
+
+verify: all suites passed
 ```
 
-Measured in this sandbox: **16 suites, 12 passed, 4 failed**.
-See [development](#development) for the failure causes.
+Measured on this machine: **16 suites, 16 passed**.
 
 
 ## Three mods
@@ -92,11 +130,7 @@ Print the card in the TUI or classic CLI:
 /svprogress
 ```
 
-Toggle the TUI widget:
-
-```text
-/progress
-```
+The widget docks itself in the TUI. There is no toggle command.
 
 Hide optional rows, then restore them:
 
@@ -244,9 +278,15 @@ It writes per-suite logs under `/tmp/verify-*.log`.
 Keepwarm tests use localhost fake providers, not live APIs.
 The progress plugin smoke test uses the active Hermes home and rewrites its progress state.
 
-This sandbox run ended with `verify: FAILED`.
-Read-only Hermes state blocked the progress plugin suite.
-Denied localhost sockets blocked keepwarm ping, fallback, and arm.
+Two suites need a normal machine:
+
+| Condition | Suites that fail |
+| :--- | :--- |
+| `$HERMES_HOME/state` is read-only | progress plugin, integration, agent train |
+| Localhost sockets are blocked | keepwarm ping, fallback, arm |
+
+Both write temporary state and talk to a fake local provider.
+Neither touches a live API.
 
 Extend [Python plugins](plugins/) and [ESM widgets](tui-widgets/).
 Keep their JSON snapshot contracts aligned.

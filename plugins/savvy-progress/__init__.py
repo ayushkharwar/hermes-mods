@@ -187,6 +187,21 @@ _last_write = 0.0
 PRICE_TABLE: Dict[str, Tuple[float, float, float]] = {
     "deepseek-v4.1-flash": (0.30, 1.20, 0.006),
     "deepseek-ai/deepseek-v4.1-flash-1017": (0.30, 1.20, 0.006),
+    # OpenAI GPT-6.x list prices, read from the OpenRouter model catalogue
+    # (openrouter.ai/api/v1/models), USD per 1M tokens: (input, output, cached input).
+    # Base tier only: the catalogue doubles every rate for a prompt above 272k tokens, which
+    # this card does not model, so a very long call reads low. `-pro` rows are longer keys,
+    # so the longest-match rule prices them before the base name.
+    "gpt-6.1-sol-pro": (4.0, 20.0, 0.20),
+    "gpt-6.1-terra-pro": (2.0, 10.0, 0.10),
+    "gpt-6-luna-pro": (0.20, 1.0, 0.02),
+    "gpt-6-astra-pro": (20.0, 100.0, 2.0),
+    "gpt-6-sol-pro": (4.0, 20.0, 0.40),
+    "gpt-6.1-sol": (2.0, 10.0, 0.10),
+    "gpt-6.1-terra": (1.0, 5.0, 0.05),
+    "gpt-6-luna": (0.10, 0.5, 0.01),
+    "gpt-6-astra": (10.0, 50.0, 1.0),
+    "gpt-6-sol": (2.0, 10.0, 0.20),
 }
 
 _PRICE_KEYS = tuple(sorted(PRICE_TABLE, key=len, reverse=True))

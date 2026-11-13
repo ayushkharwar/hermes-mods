@@ -123,6 +123,22 @@ code by writing `$HERMES_HOME/state/savvy-progress.prices.json`:
 An override outranks a baked row, because it is the more specific statement of intent. A
 malformed row is ignored, not fatal: the card falls back to the baked table.
 
+The baked table also carries the OpenAI GPT-6.x list rates read from the OpenRouter model
+catalogue, so the `codex` row has a price:
+
+| Model | input | output | cached input |
+| --- | --- | --- | --- |
+| `gpt-6.1-sol` | $2.00 | $10.00 | $0.10 |
+| `gpt-6.1-terra` | $1.00 | $5.00 | $0.05 |
+| `gpt-6-luna` | $0.10 | $0.50 | $0.01 |
+| `gpt-6-astra` | $10.00 | $50.00 | $1.00 |
+| `gpt-6-sol` | $2.00 | $10.00 | $0.20 |
+
+`-pro` rows are twice the base rate and are matched first, because the longest key wins.
+The catalogue doubles every rate again above a 272k-token prompt; this card does not model
+that tier, so a very long call reads low. `codex-auto-review` has no public rate and stays
+`$n/a`.
+
 ### Context window
 
 Read from `model.context_length` in `$HERMES_HOME/config.yaml`, cached until the file
@@ -139,6 +155,9 @@ changes, and defaulting to 1,000,000.
 | `Infinity` / `NaN` in a cost field | Sanitised before serialisation; the file always parses as strict JSON |
 | Two Hermes processes firing at once | An advisory `flock` plus an atomic `os.replace`; a busy lock skips one write instead of interleaving |
 | A codex, pi or dsh tree missing or unreadable | That agent reports `available: false`, contributes zero tokens, and is skipped on the card |
+| A transcript over 64 MB, a line over 8 MB, a decompressed dsh log over 256 MB, or a scan over 20 s | The file or the rest of the scan is skipped, the entry is marked `truncated`, and the numbers never claim full coverage |
+| A symlink, FIFO or device under a session root | Skipped. Only regular files are read, so a FIFO cannot block the scan |
+| Negative or absurd token counts | The row is rejected instead of reaching the card |
 | Cross-agent scan slower than the turn | The hook returns the previous numbers and one background thread refreshes them; the scan is single-flight |
 | `zstd` not installed | dsh reports no data; no transcript is guessed |
 | Unpriced model | Rows print `n/a` instead of inventing a dollar figure |
