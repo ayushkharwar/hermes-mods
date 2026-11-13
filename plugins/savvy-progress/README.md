@@ -17,14 +17,15 @@ cost                  ~$0.1606
 burn                  ~$0.24/h
 saved                 ~$1.9864
 today       ~$2.2493  22 chats
+tok/day              48.7M
 agents                    none
 ```
 
 ## Day boundary
 
-`today` is a local calendar day: 00:00 to the next 00:00, not a rolling 24 h window. A
-rolling window counted yesterday evening's chats as today's, which reads as a miscount. DST
-is handled by asking `mktime` for the next midnight.
+`today` and `tok/day` are a local calendar day: 00:00 to the next 00:00, not a rolling 24 h
+window. A rolling window counted yesterday evening's chats as today's, which reads as a
+miscount. DST is handled by asking `mktime` for the next midnight.
 
 ## Rows
 
@@ -38,6 +39,7 @@ is handled by asking `mktime` for the next midnight.
 | `burn` | Session cost per hour over the session's own wall clock, floored at 5 minutes |
 | `saved` | Dollars the cache avoided: `cache_read` priced at list input instead of the cache rate |
 | `today` | Every session started today, from local 00:00 to 24:00, with its session count, so cron runs and parallel terminals cannot hide |
+| `tok/day` | Tokens today across every session: `input_tokens + cache_read_tokens + cache_write_tokens + output_tokens`. Cached prompts are counted, because they still went through the model |
 | `agents` | Delegate children of the tracked session and their added cost |
 
 `cost_source` travels with each number: `provider` is a real billed figure, `table` is an
