@@ -537,6 +537,8 @@ def _read_totals(session_id: str) -> Optional[Dict[str, Any]]:
 
     calls = tokens_in = tokens_out = cache_read = cache_write = 0
     cost_total = 0.0
+    saved_total = 0.0
+    saved_source = "none"
     sources = set()
 
     for model, row_calls, r_in, r_out, r_cache, r_write, actual, estimated in rows:
@@ -553,6 +555,13 @@ def _read_totals(session_id: str) -> Optional[Dict[str, Any]]:
         cost_total += row_cost
         sources.add(row_source)
 
+        # Cache savings follow the model that owns the cached tokens. One rate for every
+        # row overstated the saving when a session mixed models with different discounts.
+        row_saved, row_saved_source = _cache_saved_usd(str(model or ""), r_cache)
+        saved_total += row_saved
+        if row_saved_source == "table":
+            saved_source = "table"
+
     if "provider" in sources:
         cost_source = "provider"
     elif "table" in sources:
@@ -568,6 +577,8 @@ def _read_totals(session_id: str) -> Optional[Dict[str, Any]]:
         "cache_write": cache_write,
         "cost_usd": round(cost_total, 6),
         "cost_source": cost_source,
+        "cache_saved_usd": round(saved_total, 6),
+        "cache_saved_source": saved_source,
     }
 
 
@@ -1463,6 +1474,7 @@ AGENT_MAX_LINE_BYTES = 8 * 1024 * 1024       # one JSONL line; longer is corrupt
 AGENT_MAX_DECOMPRESSED = 256 * 1024 * 1024   # dsh cap; a zstd bomb stops here
 AGENTS_SCAN_BUDGET_S = 20.0                  # whole-scan wall clock
 AGENT_MAX_TOKENS = 10 ** 12                  # a single count above this is invalid
+AGENT_MAX_TOKEN_TOTAL = 10 ** 15             # a cached aggregate above this is corrupt
 AGENT_PAYLOAD_MODELS = 8                     # models published into the widget snapshot
 # (agent name, env override for its sessions root, default path under $HOME, file glob)
 AGENT_SOURCES: Tuple[Tuple[str, str, str, str], ...] = (
@@ -1470,9 +1482,13 @@ AGENT_SOURCES: Tuple[Tuple[str, str, str, str], ...] = (
     ("pi", "SAVVY_PI_DIR", ".pi/agent/sessions", "*.jsonl"),
     ("dsh", "SAVVY_DSH_DIR", ".dsh/sessions", "session.jsonl.zstd"),
 )
-_MODEL_KEY_RE = re.compile(r'"model"\s*:\s*"([^"\\]{1,80})"')
+_MODEL_KEY_RE = re.compile(r'"model"\s*:\s*"([^"\\]{1,200})"')
 _ZSTD_BIN = shutil.which("zstd")
 _others_cache: Dict[str, Any] = {"ts": 0.0, "value": None}
+# A decompressor outliving the process keeps reading the disk and holds memory. Keep the
+# live set so an exit hook can stop them.
+_ACTIVE_PROCS: set = set()
+_ACTIVE_PROCS_LOCK = threading.Lock()
 _others_lock = threading.Lock()
 _others_refreshing = False
 
@@ -1689,6 +1705,17 @@ def _iter_lines(path: Path) -> Iterator[str]:
             yield line
 
 
+class _ScanTimeout(Exception):
+    """A transcript read ran past the scan deadline and was stopped."""
+
+
+def _codex_total(usage: Dict[str, Any]) -> int:
+    """The cumulative counter of one codex usage block."""
+    return _int_value(usage.get("total_tokens")) or (
+        _int_value(usage.get("input_tokens")) + _int_value(usage.get("output_tokens"))
+    )
+
+
 def _add_codex_usage(models: Dict[str, Dict[str, Any]], model: str,
                       usage: Dict[str, Any]) -> bool:
     """Add one response of codex usage to ``model``. False when the row is not plausible."""
@@ -1730,17 +1757,21 @@ def _sum_models(models: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     return tally
 
 
-def _scan_codex_file(path: Path) -> Optional[Dict[str, Any]]:
+def _scan_codex_file(path: Path, deadline: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """One codex rollout, attributed per response.
 
-    ``token_count`` events carry ``last_token_usage``: the usage of that one response, with
-    the model active at that moment. Summing those keeps a model switch from moving earlier
-    spend onto the last model. A rollout without the delta (an old build) falls back to the
-    cumulative total on the last model.
+    ``last_token_usage`` is the usage of one response. Codex repeats a notification when
+    nothing changed, so a delta is booked only when the cumulative counter advances.
+    Otherwise one response would be counted twice, which doubled real spend in a probe.
+
+    A rollout that mixes legacy cumulative-only records with new deltas keeps both: the
+    deltas cover the new part, and any shortfall against the final cumulative total is
+    booked as ``unknown`` with no price, instead of being dropped.
     """
     models: Dict[str, Dict[str, Any]] = {}
     current = ""
     cumulative: Optional[Dict[str, Any]] = None
+    previous_total = -1
     deltas = False
 
     try:
@@ -1757,9 +1788,15 @@ def _scan_codex_file(path: Path) -> Optional[Dict[str, Any]]:
                 total = info.get("total_token_usage")
                 if isinstance(total, dict):
                     cumulative = total
+                    counter = _codex_total(total)
+                    advanced = counter > previous_total
+                    previous_total = max(previous_total, counter)
+                else:
+                    advanced = True
                 last = info.get("last_token_usage")
-                if isinstance(last, dict) and _add_codex_usage(models, current, last):
-                    deltas = True
+                if advanced and isinstance(last, dict) and last:
+                    if _add_codex_usage(models, current, last):
+                        deltas = True
             elif '"model"' in line:
                 match = _MODEL_KEY_RE.search(line)
                 if match:
@@ -1772,13 +1809,22 @@ def _scan_codex_file(path: Path) -> Optional[Dict[str, Any]]:
             return None
         if not _add_codex_usage(models, current, cumulative):
             return None
+    elif isinstance(cumulative, dict):
+        booked = sum(row["tokens"] for row in models.values())
+        gap = _codex_total(cumulative) - booked
+        if gap > 0:
+            row = models.setdefault("unknown", _agent_model())
+            row["tokens"] += gap
+            row["calls"] += 1
+            row["unpriced"] = True
+            row["cost_source"] = _combine_cost_sources([row["cost_source"], "none"])
 
     if not models:
         return None
     return {"tally": _sum_models(models), "models": models}
 
 
-def _scan_pi_file(path: Path) -> Optional[Dict[str, Any]]:
+def _scan_pi_file(path: Path, deadline: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """One pi session log. Every assistant message carries its own usage and cost."""
     models: Dict[str, Dict[str, Any]] = {}
     try:
@@ -1829,7 +1875,7 @@ def _scan_pi_file(path: Path) -> Optional[Dict[str, Any]]:
     return {"tally": _sum_models(models), "models": models}
 
 
-def _scan_dsh_file(path: Path) -> Optional[Dict[str, Any]]:
+def _scan_dsh_file(path: Path, deadline: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """One dsh session, decompressed with the ``zstd`` binary.
 
     The usage chunk carries input, output and cache-read tokens but no cost, so dsh cost is
@@ -1839,12 +1885,28 @@ def _scan_dsh_file(path: Path) -> Optional[Dict[str, Any]]:
     if not _ZSTD_BIN:
         return None
 
+    budget = AGENTS_SCAN_BUDGET_S if deadline is None else max(0.5, deadline - time.time())
     try:
-        with subprocess.Popen([_ZSTD_BIN, "-dc", str(path)], stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL) as proc:
-            raw = proc.stdout.read(AGENT_MAX_DECOMPRESSED + 1) if proc.stdout else b""
-            proc.kill()
+        with _ACTIVE_PROCS_LOCK:
+            proc = subprocess.Popen([_ZSTD_BIN, "-dc", str(path)], stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+            _ACTIVE_PROCS.add(proc)
+        try:
+            try:
+                out, _err = proc.communicate(timeout=budget)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate(timeout=2)
+                raise _ScanTimeout(f"decompress exceeded {budget:.1f}s: {path.name}")
+            raw = (out or b"")[:AGENT_MAX_DECOMPRESSED + 1]
+            code = proc.returncode
+        finally:
+            with _ACTIVE_PROCS_LOCK:
+                _ACTIVE_PROCS.discard(proc)
     except (OSError, subprocess.SubprocessError):
+        return None
+    if code != 0:
+        # A failed decompressor can leave half a session on stdout. That is not spend.
         return None
     if len(raw) > AGENT_MAX_DECOMPRESSED:
         return None
@@ -1921,6 +1983,7 @@ def _agent_files(root: Path, glob: str) -> Tuple[List[Path], bool]:
 
     found: List[Tuple[float, Path]] = []
     seen: set = set()
+    oversized = False
     try:
         for path in root.rglob(glob):
             try:
@@ -1930,6 +1993,8 @@ def _agent_files(root: Path, glob: str) -> Tuple[List[Path], bool]:
             if not stat.S_ISREG(info.st_mode):
                 continue
             if info.st_size > AGENT_MAX_FILE_BYTES:
+                # Skipping is not the same as covering: say so in the flag.
+                oversized = True
                 continue
             identity = (info.st_dev, info.st_ino)
             if identity in seen:
@@ -1940,7 +2005,7 @@ def _agent_files(root: Path, glob: str) -> Tuple[List[Path], bool]:
         return [], False
 
     found.sort(key=lambda item: item[0], reverse=True)
-    truncated = len(found) > AGENTS_MAX_FILES
+    truncated = len(found) > AGENTS_MAX_FILES or oversized
     return [path for _mtime, path in found[:AGENTS_MAX_FILES]], truncated
 
 
@@ -1968,7 +2033,11 @@ def _scan_agent(name: str, env_name: str, rel: str, glob: str,
             entry["truncated"] = True
             break
         try:
-            parsed = scanner(path)
+            parsed = scanner(path, deadline)
+        except _ScanTimeout as exc:
+            logger.debug("savvy-progress: %s scan stopped at the deadline: %s", name, exc)
+            entry["truncated"] = True
+            break
         except Exception as exc:  # noqa: BLE001 — one bad transcript is not the whole agent
             logger.debug("savvy-progress: %s file skipped (%s): %s", name, path, exc)
             continue
@@ -2043,28 +2112,67 @@ def _others_path() -> Path:
 _OTHERS_FIELDS = ("ts", "agents", "tokens", "cost_usd", "cost_source", "unpriced")
 
 
+def _valid_agent_entry(entry: Any) -> bool:
+    """One cached agent row. A bad row used to pass and then break the card."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+        return False
+    for key in ("tokens", "input", "cache_read", "output", "sessions"):
+        value = entry.get(key, 0)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return False
+        if value < 0 or value > AGENT_MAX_TOKEN_TOTAL:
+            return False
+    cost = entry.get("cost_usd", 0)
+    if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+        return False
+    if not math.isfinite(float(cost)) or float(cost) < 0:
+        return False
+    if entry.get("cost_source") not in ("provider", "table", "agent", "none"):
+        return False
+    models = entry.get("models")
+    if not isinstance(models, list):
+        return False
+    for model in models:
+        if not isinstance(model, dict) or not isinstance(model.get("model"), str):
+            return False
+        tokens = model.get("tokens", 0)
+        if not isinstance(tokens, int) or isinstance(tokens, bool):
+            return False
+        if tokens < 0 or tokens > AGENT_MAX_TOKEN_TOTAL:
+            return False
+        if model.get("cost_source") not in ("provider", "table", "agent", "none"):
+            return False
+    return True
+
+
 def _valid_others_payload(value: Any) -> bool:
     """True when ``value`` has every field the snapshot and the card read from it.
 
-    A cache with a missing key used to pass the age check and then abort snapshot
-    construction, which silently froze the whole card. Validate the shape instead.
+    A cache with a missing key, a malformed agent row, or an absurd count used to pass the
+    age check and then abort snapshot construction, which froze the whole card.
     """
     if not isinstance(value, dict):
         return False
     if any(field not in value for field in _OTHERS_FIELDS):
         return False
-    if not isinstance(value["agents"], list):
+    agents = value["agents"]
+    if not isinstance(agents, list):
+        return False
+    if not all(_valid_agent_entry(agent) for agent in agents):
         return False
     tokens = value["tokens"]
-    if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
+    if not isinstance(tokens, int) or isinstance(tokens, bool):
         return False
-    if not isinstance(value["cost_usd"], (int, float)) or isinstance(value["cost_usd"], bool):
+    if tokens < 0 or tokens > AGENT_MAX_TOKEN_TOTAL:
+        return False
+    cost = value["cost_usd"]
+    if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+        return False
+    if not math.isfinite(float(cost)) or float(cost) < 0:
         return False
     if value["cost_source"] not in ("provider", "table", "agent", "none"):
         return False
-    if not isinstance(value["unpriced"], bool):
-        return False
-    return True
+    return isinstance(value["unpriced"], bool)
 
 
 def _read_others_cache(now: float) -> Optional[Dict[str, Any]]:
@@ -2152,18 +2260,30 @@ def _stale_others(now: float) -> Dict[str, Any]:
 _last_payload: Optional[Dict[str, Any]] = None
 
 
+_publish_lock = threading.Lock()
+
+
 def _republish(**changes: Any) -> bool:
     """Rewrite the snapshot with a few replaced fields, so the widget sees them at once.
 
-    The card keeps its own ``ts``: this is a content refresh, not a new usage sample, and a
-    fresh timestamp over an old session would hide staleness behind live sibling numbers.
+    The merged result becomes the new canonical payload. Without that, a later republication
+    started from the stale copy and silently undid the previous change: scan, hide and scan
+    again lost both the newest totals and the hidden rows.
+
+    The card keeps its own ``ts``: this is a content refresh, not a new usage sample.
     """
+    global _last_payload
+
     payload = _last_payload
     if not isinstance(payload, dict) or not payload:
         return False
-    merged = dict(payload)
-    merged.update(changes)
-    return _write_json_atomic(_snapshot_path(), merged)
+    with _publish_lock:
+        merged = dict(payload)
+        merged.update(changes)
+        written = _write_json_atomic(_snapshot_path(), merged)
+        if written:
+            _last_payload = merged
+        return written
 
 
 def _republish_others(value: Dict[str, Any]) -> bool:
@@ -2296,7 +2416,8 @@ def _build_snapshot(
     day_start, day_end = _day_bounds(now)
     day = _day_spend(now)
     burn_usd_per_hour, _elapsed_s = _burn_rate(total_cost, _read_session_start(primary_id), now)
-    cache_saved, cache_saved_source = _cache_saved_usd(model, primary["cache_read"])
+    cache_saved = _finite(primary.get("cache_saved_usd"))
+    cache_saved_source = str(primary.get("cache_saved_source") or "none")
     # Cross-agent spend is cached for a minute; the call is cheap on every other hook.
     others = _others_totals(now)
 
@@ -2353,8 +2474,11 @@ def _build_snapshot(
         # Rows the user switched off. The widget drops them; the card skips their lines.
         "hidden_rows": _hidden_rows(),
     }
-    global _last_payload
-    _last_payload = payload
+    if not self_view:
+        # A delegate builds its own view before the shared card. Booking that as canonical
+        # let a finished scan republish the delegate's numbers over the primary card.
+        global _last_payload
+        _last_payload = payload
 
     new_entry = {
         "turn": turn,
@@ -2556,7 +2680,8 @@ def _age_text(seconds: float) -> str:
 
 def _header(model: Any, provider: Any) -> str:
     """One line: PROGRESS, the model tail, the provider. Always under CARD_W."""
-    tail = (str(model or "unknown").split("/") or ["unknown"])[-1] or "unknown"
+    clean = "".join(ch for ch in str(model or "unknown") if ch >= " " and ch != "\x7f")
+    tail = (clean.split("/") or ["unknown"])[-1] or "unknown"
     prov = str(provider or "").strip()
     room = CARD_W - len("PROGRESS  ") - (len(prov) + 2 if prov else 0)
     if len(tail) > room:
@@ -2615,6 +2740,13 @@ def _agent_cell(value: Any, width: int) -> str:
 def _agent_cost_cell(cost: Any, source: str, unpriced: bool) -> str:
     """``$n/a``, ``$1.5040``, ``~$1.5040``; a ``?`` marks a priced-total that leaves an
     unpriced model out. ``$n/a?`` would say the same thing twice, so it never appears."""
+    try:
+        amount = max(0.0, float(cost or 0.0))
+    except (TypeError, ValueError):
+        amount = 0.0
+    if amount >= 100.0 and source in ("provider", "table", "agent"):
+        mark = "~" if source in ("table", "agent") else ""
+        return f"{mark}${amount:.2f}" + ("?" if unpriced else "")
     value, _suffix = _cost_text(cost, source)
     if unpriced and source != "none":
         return value + "?"
@@ -2658,8 +2790,8 @@ def _others_lines(payload: Dict[str, Any], hidden: Any = None) -> List[str]:
         return []
 
     skip = {str(key) for key in (hidden or ())}
-    if "others" in skip:
-        return []
+    # `others` names the combined row in the widget, so it hides only that row here too.
+    show_total = "others" not in skip
 
     lines: List[str] = []
     contributors = 0
@@ -2674,7 +2806,7 @@ def _others_lines(payload: Dict[str, Any], hidden: Any = None) -> List[str]:
             continue
         reachable += 1
         source = str(entry.get("cost_source") or "none")
-        if source not in ("provider", "table", "none"):
+        if source not in ("provider", "table", "agent", "none"):
             source = "none"
         unpriced = bool(entry.get("unpriced"))
         models = [m for m in (entry.get("models") or []) if isinstance(m, dict)]
@@ -2687,7 +2819,7 @@ def _others_lines(payload: Dict[str, Any], hidden: Any = None) -> List[str]:
 
         for model in models[:AGENT_MODEL_ROWS]:
             model_source = str(model.get("cost_source") or "none")
-            if model_source not in ("provider", "table", "none"):
+            if model_source not in ("provider", "table", "agent", "none"):
                 model_source = "none"
             lines.append(
                 _agent_row("", "· " + _agent_model_tail(model.get("model")), model.get("tokens"),
@@ -2703,14 +2835,18 @@ def _others_lines(payload: Dict[str, Any], hidden: Any = None) -> List[str]:
         return []
 
     source = str(payload.get("others_source") or "none")
-    if source not in ("provider", "table", "none"):
+    if source not in ("provider", "table", "agent", "none"):
         source = "none"
-    lines.append(
+    if show_total:
+        lines.append(
         # The amount sums every available agent, so the label counts every contributor,
         # not only the rows still visible.
-        _agent_row(f"total {contributors}", "all models", payload.get("others_tokens"),
-                   payload.get("others_cost_usd"), source, bool(payload.get("others_unpriced")))
-    )
+            _agent_row(f"total {contributors}", "all models", payload.get("others_tokens"),
+                       payload.get("others_cost_usd"), source,
+                       bool(payload.get("others_unpriced")))
+        )
+    if len(lines) == 1 and lines[0] == "  other agents":
+        return []
     return lines
 
 
@@ -2871,7 +3007,15 @@ def _cmd_progress(raw_args: str = "", *args: Any, **kwargs: Any) -> str:
         if verb in ("show", "on", "unmute") and names:
             return _toggle_rows(names, False)
         if verb in ("reset", "all", "clear"):
-            _write_hidden_rows([])
+            path = _rows_path()
+            with _write_lock(path.parent / (path.name + ".update")) as taken:
+                if not taken:
+                    return "savvy-progress: rows file is busy, try again"
+                _rows_cache["key"] = None
+                written = _write_hidden_rows([])
+            if not written:
+                return "savvy-progress: rows not saved (state directory read-only?)"
+            _republish(hidden_rows=[])
             return "savvy-progress: every row shown"
         if verb in ("rows", "list"):
             return _rows_summary()

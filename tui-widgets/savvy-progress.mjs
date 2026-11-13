@@ -82,6 +82,61 @@ const EMPTY = {
 
 const COST_SOURCES = new Set(['provider', 'table', 'agent', 'none'])
 
+/** Terminal cells, not codepoints. A CJK glyph is two cells wide, so a row padded by
+ *  codepoint count overflows its declared width and the card reflows. */
+const WIDE_RANGES = [
+  [0x1100, 0x115f], [0x2e80, 0xa4cf], [0xac00, 0xd7a3], [0xf900, 0xfaff],
+  [0xfe30, 0xfe6f], [0xff00, 0xff60], [0xffe0, 0xffe6], [0x1f300, 0x1f64f],
+  [0x1f900, 0x1f9ff]
+]
+
+export function cellWidth(char) {
+  const code = char.codePointAt(0) || 0
+
+  return WIDE_RANGES.some(([low, high]) => code >= low && code <= high) ? 2 : 1
+}
+
+/** Drop control characters. A model name comes from another agent's transcript. */
+export function stripControl(value) {
+  return [...String(value ?? '')].filter(char => char >= ' ' && char !== '\x7f').join('')
+}
+
+export function cellsOf(value) {
+  let total = 0
+
+  for (const char of stripControl(value)) {
+    total += cellWidth(char)
+  }
+
+  return total
+}
+
+/** Fit a string into a cell budget: cut with an ellipsis, then pad on the asked side. */
+export function fitCells(value, width, align = 'end') {
+  const body = stripControl(value)
+  let out = ''
+  let used = 0
+
+  for (const char of body) {
+    const size = cellWidth(char)
+
+    if (used + size > width) {
+      break
+    }
+
+    out += char
+    used += size
+  }
+
+  if (cellsOf(body) > width && out) {
+    out = out.slice(0, -1) + '…'
+  }
+
+  const pad = ' '.repeat(Math.max(0, width - cellsOf(out)))
+
+  return align === 'start' ? out + pad : pad + out
+}
+
 function num(value, fallback = 0) {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
@@ -281,10 +336,9 @@ function fmt(n) {
 }
 
 function shortModel(model) {
-  const tail = (model || '').split('/').pop() || 'unknown'
-  const body = tail.length > VALUE_W ? `${tail.slice(0, VALUE_W - 1)}…` : tail
+  const tail = stripControl((model || '').split('/').pop() || 'unknown')
 
-  return body.padEnd(VALUE_W)
+  return fitCells(tail, VALUE_W, 'start')
 }
 
 /** Read the snapshot file. Returns ``null`` when the file is missing, unreadable, not JSON,
@@ -365,9 +419,7 @@ export function buildRows(parts, snap, t) {
   /** One card row: fixed label column plus a fixed 22-cell value field.
    *  `align` is 'end' for numbers and 'start' for text, so nothing shifts between ticks. */
   const row = (key, label, value, tone, align = 'end') => {
-    const body = String(value ?? '')
-    const cell = (body.length > VALUE_W ? `${body.slice(0, VALUE_W - 1)}…` : body)
-    const pad = align === 'start' ? cell.padEnd(VALUE_W) : cell.padStart(VALUE_W)
+    const pad = fitCells(value, VALUE_W, align)
 
     return h(
       Box,

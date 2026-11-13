@@ -6,7 +6,7 @@
  * overflow, garbage, and file-level cases (missing, malformed, one chat).
  * Run: node test_widget.mjs
  */
-import { buildRows, formatCost, formatBurn, formatSaved, formatToday, formatAgents, formatAgent, readSnapshot, mergeSnapshot, formatAge, staleLabel } from '../../tui-widgets/savvy-progress.mjs'
+import { buildRows, formatCost, formatBurn, formatSaved, formatToday, formatAgents, formatAgent, cellsOf, fitCells, readSnapshot, mergeSnapshot, formatAge, staleLabel } from '../../tui-widgets/savvy-progress.mjs'
 import register from '../../tui-widgets/savvy-progress.mjs'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -57,7 +57,7 @@ function assertRows(name, snapshot, expectations = {}) {
   for (const row of rows) {
     const key = row.props?.rowKey
     const text = textOf(row)
-    const width = [...text].length
+    const width = cellsOf(text)
     check(`${name}: ${key} width ${ROW_W}`, width === ROW_W, `got ${width} (${JSON.stringify(text)})`)
     check(`${name}: ${key} props width`, row.props?.width === ROW_W, String(row.props?.width))
   }
@@ -143,6 +143,14 @@ check('formatCost still 8 cells', formatCost(0.0123, 'table').length === 8)
 check('formatAgents none width', formatAgents({ count: 0 }).length === VALUE_W)
 
 // 9b. other-agent rows: cost + tokens, `none` when absent, `?` on an unpriced part
+check('cells: CJK is two cells', cellsOf('界界') === 4, String(cellsOf('界界')))
+check('fitCells: wide text fits the cell budget', cellsOf(fitCells('界'.repeat(22), VALUE_W)) === VALUE_W,
+  String(cellsOf(fitCells('界'.repeat(22), VALUE_W))))
+check('fitCells: no unpaired surrogate', !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(fitCells('a\n界'.repeat(9), VALUE_W)))
+check('fitCells: control characters removed', !fitCells('a\u0000b\u001b[31m', VALUE_W).includes('\u001b'))
+const wideRows = buildRows(parts, { ...normal, model: '界'.repeat(24) }, t)
+check('wide model row stays ROW_W cells', cellsOf(textOf(wideRows[0])) === ROW_W,
+  String(cellsOf(textOf(wideRows[0]))))
 check('formatAgent none width', formatAgent(null).length === VALUE_W)
 check('formatAgent none text', formatAgent(null).trim() === 'none', JSON.stringify(formatAgent(null)))
 check('formatAgent tokens only', formatAgent({ tokens: 21631256, cost_usd: 0, cost_source: 'none', unpriced: true }).trim() === '$n/a 21.6M', JSON.stringify(formatAgent({ tokens: 21631256, cost_usd: 0, cost_source: 'none', unpriced: true })))
@@ -164,7 +172,7 @@ check('hidden rows: no hidden key survives',
   hiddenSet.map(entry => entry.props.rowKey).join(','))
 check('hidden rows: the rest keep their width',
   hiddenSet.every(entry => [...textOf(entry)].length === ROW_W),
-  hiddenSet.map(entry => [...textOf(entry)].length).join(','))
+  hiddenSet.map(entry => cellsOf(textOf(entry))).join(','))
 check('hidden rows: every row hides',
   buildRows(parts, { ...normal, hidden_rows: ['model', 'tokens', 'cache', 'ctx', 'cost', 'burn', 'saved', 'today', 'daytok', 'codex', 'pi', 'dsh', 'others', 'agents'] }, t).length === 0)
 check('hidden rows: unknown names are ignored',

@@ -21,6 +21,7 @@ run "savvy-progress integration" python3 tests/savvy-progress/test_integration.p
 run "savvy-progress hardening"   python3 tests/savvy-progress/test_hardening.py
 run "savvy-progress agents"      python3 tests/savvy-progress/test_agents.py
 run "savvy-progress rows"        python3 tests/savvy-progress/test_rows.py
+run "savvy-progress regressions" python3 tests/savvy-progress/test_regressions.py
 run "savvy-progress concurrency" python3 tests/savvy-progress/test_concurrency.py
 run "savvy-progress soak"        python3 tests/savvy-progress/test_soak.py
 run "filetree-rail plugin"   python3 tests/filetree-rail/test_plugin.py
