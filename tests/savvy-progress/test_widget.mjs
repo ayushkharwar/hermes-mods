@@ -47,7 +47,7 @@ function rowsOf(snapshot) {
 
 function assertRows(name, snapshot, expectations = {}) {
   const rows = rowsOf(snapshot)
-  check(`${name}: row count`, rows.length === 9, String(rows.length))
+  check(`${name}: row count`, rows.length === 10, String(rows.length))
   for (const row of rows) {
     const key = row.props?.key
     const text = textOf(row)
@@ -211,7 +211,7 @@ check('register: card renders a Dialog', Boolean(tree) && tree.type === 'Dialog'
 check('register: dialog title PROGRESS', String(tree?.props?.title).startsWith('PROGRESS'), String(tree?.props?.title))
 check('register: dialog width 36', tree?.props?.width === 36, String(tree?.props?.width))
 const inner = tree?.kids?.[0]
-check('register: 9 rows inside', (inner?.kids || []).length === 9, String((inner?.kids || []).length))
+check('register: 10 rows inside', (inner?.kids || []).length === 10, String((inner?.kids || []).length))
 
 let oldSdkError = null
 try {

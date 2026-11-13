@@ -13,6 +13,7 @@
  *   burn            ~$0.55/h
  *   saved           ~$0.2401
  *   today      ~$2.1871  25 chats
+ *   tok/day           18.4M
  *   agents   3   +$0.0412
  *
  * Column rules: the model is cut to its last path segment, every number is padded into
@@ -57,6 +58,7 @@ const EMPTY = {
   day_cost_usd: 0,
   day_sessions: 0,
   day_source: 'none',
+  day_tokens: 0,
   delegates: { cost_source: 'none', cost_usd: 0, count: 0 },
   input_tokens: 0,
   model: '',
@@ -160,6 +162,13 @@ export function formatToday(value, source, sessions) {
   return `${cost}  ${tail}`.padStart(VALUE_W)
 }
 
+/** Day token row: every token the day pushed through a model (input + cache read +
+ *  cache write + output), compacted into 6 cells and padded to the value field:
+ *   `                18.4M`   `                    0` */
+export function formatDayTokens(value) {
+  return fmt(Math.max(0, num(value))).padStart(VALUE_W)
+}
+
 /** Coerce one parsed JSON object into the shape the rows expect. Never throws. */
 function normalize(raw) {
   if (!raw || typeof raw !== 'object') {
@@ -189,6 +198,7 @@ function normalize(raw) {
     day_cost_usd: Math.max(0, num(raw.day_cost_usd)),
     day_sessions: Math.max(0, Math.floor(num(raw.day_sessions))),
     day_source: sourceField(raw.day_source, 'none'),
+    day_tokens: Math.max(0, num(raw.day_tokens)),
     delegates: {
       cost_source: sourceField(rawDelegates.cost_source, 'none'),
       cost_usd: Math.max(0, num(rawDelegates.cost_usd)),
@@ -341,6 +351,7 @@ export function buildRows(parts, snap, t) {
     row('burn', 'burn', formatBurn(snap.burn_usd_per_hour, snap.burn_source), t.color.text),
     row('saved', 'saved', formatSaved(snap.cache_saved_usd, snap.cache_saved_source), t.color.ok),
     row('today', 'today', formatToday(snap.day_cost_usd, snap.day_source, snap.day_sessions), t.color.accent),
+    row('daytok', 'tok/day', formatDayTokens(snap.day_tokens), t.color.text),
     row('agents', 'agents', formatAgents(snap.delegates), hasAgents ? t.color.text : t.color.muted)
   ]
 }

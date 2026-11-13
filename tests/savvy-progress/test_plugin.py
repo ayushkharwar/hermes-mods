@@ -62,7 +62,15 @@ SPEND_KEYS = {
     "day_sessions",
     "day_window_s",
 }
-CONTRACT_KEYS = BASE_KEYS | NEW_KEYS | SPEND_KEYS
+# The five keys behind the token/day row: the day total and its four parts.
+DAY_TOKEN_KEYS = {
+    "day_tokens",
+    "day_input_tokens",
+    "day_output_tokens",
+    "day_cache_read",
+    "day_cache_write",
+}
+CONTRACT_KEYS = BASE_KEYS | NEW_KEYS | SPEND_KEYS | DAY_TOKEN_KEYS
 DELEGATE_KEYS = {"count", "input_tokens", "output_tokens", "cache_read", "cost_usd", "cost_source"}
 
 COST_SOURCES = {"provider", "table", "none"}
@@ -712,7 +720,7 @@ def main() -> int:
             payload = fire(plugin, "golden-A")
             shapes.append(set(payload))
             run.append({k: v for k, v in payload.items() if k in BASE_KEYS and k != "ts"})
-    check("contract size matches the key set", len(CONTRACT_KEYS) == 27, f"n={len(CONTRACT_KEYS)}")
+    check("contract size matches the key set", len(CONTRACT_KEYS) == 32, f"n={len(CONTRACT_KEYS)}")
     check(f"every single-session payload has exactly the {len(CONTRACT_KEYS)} contract keys",
           all(shape == CONTRACT_KEYS for shape in shapes),
           f"n_keys={[len(s) for s in shapes]}")

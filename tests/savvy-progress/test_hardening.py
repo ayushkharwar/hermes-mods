@@ -114,7 +114,13 @@ def run(root: Path) -> int:
     sandbox(m, root)
 
     # ---- 1. missing DB --------------------------------------------------------
-    check("missing db: day spend zeros", m._day_spend(time.time()) == {"cost_usd": 0.0, "cost_source": "none", "sessions": 0})
+    zero_day = m._day_spend(time.time())
+    check("missing db: day spend zeros",
+          zero_day["cost_usd"] == 0.0 and zero_day["cost_source"] == "none"
+          and zero_day["sessions"] == 0 and zero_day["tokens"] == 0
+          and zero_day["input_tokens"] == zero_day["output_tokens"] == 0
+          and zero_day["cache_read"] == zero_day["cache_write"] == 0,
+          repr(zero_day))
     check("missing db: totals None", m._read_totals("local-x") is None)
     check("missing db: model unknown", m._read_model("local-x") == ("unknown", ""))
     check("missing db: context 0", m._read_context_tokens("local-x") == 0)

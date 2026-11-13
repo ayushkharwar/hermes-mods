@@ -287,6 +287,7 @@ SELECT u.model,
        u.input_tokens,
        u.output_tokens,
        u.cache_read_tokens,
+       u.cache_write_tokens,
        u.actual_cost_usd,
        u.estimated_cost_usd,
        u.session_id
@@ -706,7 +707,14 @@ def _day_spend(now: float) -> Dict[str, Any]:
     total = 0.0
     sources = set()
     sessions = set()
-    for model, r_in, r_out, r_cache, actual, estimated, session_id in rows:
+    day_in = day_out = day_cache = day_cache_write = 0
+    for model, r_in, r_out, r_cache, r_cache_write, actual, estimated, session_id in rows:
+        # Tokens are counted raw, the same way the provider bills them: a cached prompt is
+        # still tokens through the model, just cheaper ones.
+        day_in += max(0, int(r_in or 0))
+        day_out += max(0, int(r_out or 0))
+        day_cache += max(0, int(r_cache or 0))
+        day_cache_write += max(0, int(r_cache_write or 0))
         row_cost, row_source = _resolve_cost(
             str(model or ""),
             int(r_in or 0),
@@ -725,7 +733,18 @@ def _day_spend(now: float) -> Dict[str, Any]:
         source = "table"
     else:
         source = "none"
-    result = {"cost_usd": round(_finite(total), 6), "cost_source": source, "sessions": len(sessions)}
+    result = {
+        "cost_usd": round(_finite(total), 6),
+        "cost_source": source,
+        "sessions": len(sessions),
+        # Every token the day pushed through a model: fresh input, cached input, cache
+        # writes and output, summed. The card shows the total; the parts are kept for tests.
+        "input_tokens": day_in,
+        "output_tokens": day_out,
+        "cache_read": day_cache,
+        "cache_write": day_cache_write,
+        "tokens": day_in + day_out + day_cache + day_cache_write,
+    }
     _day_cache["key"] = key
     _day_cache["value"] = dict(result)
     return dict(result)
@@ -1517,6 +1536,12 @@ def _build_snapshot(
         "day_source": day["cost_source"],
         "day_sessions": day["sessions"],
         "day_window_s": round(day_end - day_start, 1),
+        # Day token total: input + cache read + cache write + output, all sessions, all models.
+        "day_tokens": day["tokens"],
+        "day_input_tokens": day["input_tokens"],
+        "day_output_tokens": day["output_tokens"],
+        "day_cache_read": day["cache_read"],
+        "day_cache_write": day["cache_write"],
     }
     new_entry = {
         "turn": turn,
@@ -1840,6 +1865,7 @@ def render_card(payload: Dict[str, Any]) -> str:
         _row("burn/hour", _rate_text(payload.get("burn_usd_per_hour"), source)),
         _row("cache saved", saved_value, f"   {saved_suffix}" if saved_suffix else ""),
         _row("today", day_value, day_tail),
+        _row("tokens/day", _thousands(payload.get("day_tokens"))),
         agents_row,
         rule,
     ]
