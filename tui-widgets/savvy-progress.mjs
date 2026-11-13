@@ -14,6 +14,10 @@
  *   saved           ~$0.2401
  *   today      ~$2.1871  25 chats
  *   tok/day           18.4M
+ *   codex     ~$0.0000 21.6M?
+ *   pi        ~$1.6343 111.3M
+ *   dsh       ~$3.0715  93.8M
+ *   others    ~$4.7058 226.8M
  *   agents   3   +$0.0412
  *
  * Column rules: the model is cut to its last path segment, every number is padded into
@@ -59,6 +63,12 @@ const EMPTY = {
   day_sessions: 0,
   day_source: 'none',
   day_tokens: 0,
+  others: [],
+  others_cost_usd: 0,
+  others_source: 'none',
+  others_tokens: 0,
+  others_unpriced: false,
+  hidden_rows: [],
   delegates: { cost_source: 'none', cost_usd: 0, count: 0 },
   input_tokens: 0,
   model: '',
@@ -169,6 +179,27 @@ export function formatDayTokens(value) {
   return fmt(Math.max(0, num(value))).padStart(VALUE_W)
 }
 
+/** One other-agent row: cost then that agent's token total, or `none` when the agent has
+ *  no transcript on this machine. `?` marks a cost that leaves an unpriced model out.
+ *  Fixed 22 cells:  ``~$1.6343 111.3M``   ``      $n/a 21.6M?``   ``                  none`` */
+export function formatAgent(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return 'none'.padStart(VALUE_W)
+  }
+
+  const tokens = Math.max(0, num(entry.tokens))
+
+  if (!tokens && !num(entry.cost_usd)) {
+    return 'none'.padStart(VALUE_W)
+  }
+
+  const source = sourceField(entry.cost_source, 'none')
+  const cost = formatCost(entry.cost_usd, source).trimStart()
+  const mark = entry.unpriced && source !== 'none' ? '?' : ''
+
+  return `${cost}${mark} ${fmt(tokens)}`.padStart(VALUE_W)
+}
+
 /** Coerce one parsed JSON object into the shape the rows expect. Never throws. */
 function normalize(raw) {
   if (!raw || typeof raw !== 'object') {
@@ -184,6 +215,17 @@ function normalize(raw) {
   const rawDelegates = raw.delegates && typeof raw.delegates === 'object' ? raw.delegates : {}
   const count = Math.max(0, Math.floor(num(rawDelegates.count)))
   const window = Math.floor(num(raw.context_window, DEFAULT_CONTEXT_WINDOW))
+  const others = Array.isArray(raw.others)
+    ? raw.others
+        .filter(entry => entry && typeof entry === 'object')
+        .map(entry => ({
+          name: typeof entry.name === 'string' ? entry.name : '',
+          tokens: Math.max(0, num(entry.tokens)),
+          cost_usd: Math.max(0, num(entry.cost_usd)),
+          cost_source: sourceField(entry.cost_source, 'none'),
+          unpriced: entry.unpriced === true
+        }))
+    : []
 
   return {
     burn_source: sourceField(raw.burn_source, costSourceOf(raw)),
@@ -206,6 +248,14 @@ function normalize(raw) {
     },
     input_tokens: Math.max(0, num(raw.input_tokens)),
     model: typeof raw.model === 'string' ? raw.model : '',
+    others,
+    others_cost_usd: Math.max(0, num(raw.others_cost_usd)),
+    others_source: sourceField(raw.others_source, 'none'),
+    others_tokens: Math.max(0, num(raw.others_tokens)),
+    others_unpriced: raw.others_unpriced === true,
+    hidden_rows: Array.isArray(raw.hidden_rows)
+      ? raw.hidden_rows.filter(name => typeof name === 'string')
+      : [],
     output_tokens: Math.max(0, num(raw.output_tokens)),
     primary_session: typeof raw.primary_session === 'string' ? raw.primary_session : '',
     total_cost_usd: Math.max(0, num(raw.total_cost_usd, num(raw.cost_usd))),
@@ -341,8 +391,18 @@ export function buildRows(parts, snap, t) {
   const ctxGauge = String(gauge(ctxRatio, GAUGE_W)).slice(0, GAUGE_W).padEnd(GAUGE_W)
   const ctxPct = `${(ctxRatio * 100).toFixed(1)}%`.padStart(PCT_W)
   const hasAgents = snap.delegates.count > 0
+  const agentOf = name => (snap.others || []).find(entry => entry.name === name)
+  const agentTone = entry => (entry && (num(entry.tokens) || num(entry.cost_usd)))
+    ? t.color.text
+    : t.color.muted
+  const othersTotal = {
+    tokens: snap.others_tokens,
+    cost_usd: snap.others_cost_usd,
+    cost_source: snap.others_source,
+    unpriced: snap.others_unpriced
+  }
 
-  return [
+  const rows = [
     row('model', 'model', shortModel(snap.model), t.color.text, 'start'),
     row('tokens', 'tokens', `${fmt(snap.input_tokens)} / ${fmt(snap.output_tokens)}`, t.color.text),
     row('cache', 'cache', `${gaugeText} ${pctText}`, hitTone),
@@ -352,8 +412,15 @@ export function buildRows(parts, snap, t) {
     row('saved', 'saved', formatSaved(snap.cache_saved_usd, snap.cache_saved_source), t.color.ok),
     row('today', 'today', formatToday(snap.day_cost_usd, snap.day_source, snap.day_sessions), t.color.accent),
     row('daytok', 'tok/day', formatDayTokens(snap.day_tokens), t.color.text),
+    row('codex', 'codex', formatAgent(agentOf('codex')), agentTone(agentOf('codex'))),
+    row('pi', 'pi', formatAgent(agentOf('pi')), agentTone(agentOf('pi'))),
+    row('dsh', 'dsh', formatAgent(agentOf('dsh')), agentTone(agentOf('dsh'))),
+    row('others', 'others', formatAgent(othersTotal), t.color.accent),
     row('agents', 'agents', formatAgents(snap.delegates), hasAgents ? t.color.text : t.color.muted)
   ]
+  const hide = new Set(snap.hidden_rows || [])
+
+  return hide.size ? rows.filter(entry => !hide.has(entry.props.key)) : rows
 }
 
 export default function register(sdk) {

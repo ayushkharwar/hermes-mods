@@ -11,7 +11,7 @@ no patch of the Hermes source.
 
 | Mod | Type | What it does |
 |---|---|---|
-| `savvy-progress` | plugin + widget | Live card for your current chat: model, tokens, cache hit rate, context usage, cost, burn rate, cache savings, today's spend and today's token total across every session, and the cost of delegate children that chat spawned |
+| `savvy-progress` | plugin + widget | Live card for your current chat: model, tokens, cache hit rate, context usage, cost, burn rate, cache savings, today's spend and today's token total across every session, the cost of delegate children that chat spawned, and the spend and token total of codex, pi and dsh on this machine |
 | `filetree-rail` | plugin + widget | Ambient rail of files the agent read or wrote, plus a modal `/explorer` with keyboard navigation and a file preview |
 | `keepwarm` | plugin | `/keepwarm` replays the session's last API request with `max_tokens=1` on a timer, so the provider prompt cache stays warm until `/keepwarm-stop`. If the relay rejects the body's tool array, the ping retries without tools and keeps the conversation prefix, which is what the cache actually matches |
 
@@ -105,7 +105,8 @@ docs/           build reports and smoke logs per mod
 - The cost card follows the last `tui` session that made an API call. Switching chat without
   sending a message keeps the previous chat's numbers on screen until your first turn lands.
 - Prices ship as a small table for the DeepSeek lane used during development. Edit
-  `PRICE_TABLE` in `plugins/savvy-progress/__init__.py` for your own provider.
+  `PRICE_TABLE` in `plugins/savvy-progress/__init__.py` for your own provider. Rows can be
+hidden with `/svprogress hide burn codex` (see the plugin README).
 
 ## License
 

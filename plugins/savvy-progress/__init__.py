@@ -78,7 +78,9 @@ import logging
 import math
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 from contextlib import contextmanager
@@ -1410,6 +1412,564 @@ def _delta(prev: Dict[str, Any], totals: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# --- other-agent spend (codex / pi / dsh) -----------------------------------------
+# Hermes' own tables only see Hermes. Spend in a sibling agent sits in that agent's own
+# transcript, so this section reads the three local ones directly:
+#
+#   codex  ~/.codex/sessions/**/*.jsonl             payload.info.total_token_usage (cumulative)
+#   pi     ~/.pi/agent/sessions/**/*.jsonl          message.usage per response, plus its cost block
+#   dsh    ~/.dsh/sessions/**/session.jsonl.zstd    assistant/chunk usage inside a zstd frame
+#
+# Token rule: every token the agent pushed through a model, so fresh input + cache read +
+# output. A cache read is billed input, not a free token.
+# Cost rule: the agent's own reported cost when it reports one (pi does), else
+# ``PRICE_TABLE``, else unknown. Unknown never becomes ``$0.00``: it prints ``$n/a`` and
+# raises ``unpriced``, so an estimate can never be mistaken for a measurement.
+#
+# A full scan costs a few hundred milliseconds, so it runs at most once per
+# ``AGENTS_CACHE_S`` and the result is kept in memory and on disk. Any failure keeps the
+# previous numbers: a broken sibling transcript must never break the card.
+AGENTS_CACHE_NAME = "savvy-progress.agents.json"
+AGENTS_CACHE_S = 60.0
+AGENTS_MAX_FILES = 4000
+AGENT_MODEL_ROWS = 3
+AGENTS_OFF_ENV = "SAVVY_AGENTS_OFF"
+# (agent name, env override for its sessions root, default path under $HOME, file glob)
+AGENT_SOURCES: Tuple[Tuple[str, str, str, str], ...] = (
+    ("codex", "SAVVY_CODEX_DIR", ".codex/sessions", "*.jsonl"),
+    ("pi", "SAVVY_PI_DIR", ".pi/agent/sessions", "*.jsonl"),
+    ("dsh", "SAVVY_DSH_DIR", ".dsh/sessions", "session.jsonl.zstd"),
+)
+_MODEL_KEY_RE = re.compile(r'"model"\s*:\s*"([^"\\]{1,80})"')
+_ZSTD_BIN = shutil.which("zstd")
+_others_cache: Dict[str, Any] = {"ts": 0.0, "value": None}
+_others_lock = threading.Lock()
+_others_refreshing = False
+
+# --- row toggles ------------------------------------------------------------------
+# Every row the card can draw, keyed by the name the widget uses. A hidden row is not
+# drawn at all: no blank line, no zero, no header. The list lives in
+# ``state/savvy-progress.rows.json`` so one edit or one ``/svprogress hide`` keeps working
+# across restarts, and the payload carries it to the widget.
+ROWS_NAME = "savvy-progress.rows.json"
+ROW_KEYS: Tuple[str, ...] = (
+    "model", "api", "tokens", "cache", "ctx", "cost", "burn", "saved", "today", "daytok",
+    "codex", "pi", "dsh", "others", "agents",
+)
+# Spoken aliases: the slash command accepts the label the user reads on the card.
+ROW_ALIASES: Dict[str, str] = {
+    "in": "tokens",
+    "out": "tokens",
+    "input": "tokens",
+    "output": "tokens",
+    "tokens/day": "daytok",
+    "tok/day": "daytok",
+    "day": "today",
+    "context": "ctx",
+    "delegates": "agents",
+    "delegate": "agents",
+    "other": "others",
+    "side": "others",
+    "ext": "others",
+    "cache_saved": "saved",
+    "calls": "api",
+    "api calls": "api",
+    "burn/hour": "burn",
+}
+_rows_cache: Dict[str, Any] = {"key": None, "hidden": ()}
+
+
+def _rows_path() -> Path:
+    return _hermes_home() / "state" / ROWS_NAME
+
+
+def _normalize_row(name: Any) -> Optional[str]:
+    """One spoken or written row name to its row key, or None when it is not a row."""
+    text = str(name or "").strip().lower().lstrip("-")
+    if not text:
+        return None
+    text = ROW_ALIASES.get(text, text)
+    return text if text in ROW_KEYS else None
+
+
+def _rows_stamp() -> Any:
+    try:
+        stat = _rows_path().stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _hidden_rows() -> List[str]:
+    """Hidden row keys, in ROW_KEYS order. Missing or unreadable config hides nothing."""
+    stamp = _rows_stamp()
+    if _rows_cache.get("key") == stamp:
+        return list(_rows_cache.get("hidden") or ())
+
+    hidden: set = set()
+    if stamp is not None:
+        try:
+            raw = json.loads(_rows_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            raw = None
+        if isinstance(raw, dict):
+            listed = raw.get("hidden")
+            if isinstance(listed, list):
+                for name in listed:
+                    key = _normalize_row(name)
+                    if key:
+                        hidden.add(key)
+            elif isinstance(listed, str):
+                key = _normalize_row(listed)
+                if key:
+                    hidden.add(key)
+
+    ordered = [key for key in ROW_KEYS if key in hidden]
+    _rows_cache["key"] = stamp
+    _rows_cache["hidden"] = tuple(ordered)
+    return ordered
+
+
+def _write_hidden_rows(hidden: List[str]) -> bool:
+    """Persist the hidden set. Returns False when the file could not be written."""
+    ordered = [key for key in ROW_KEYS if key in set(hidden)]
+    ok = _write_json_atomic(_rows_path(), {"hidden": ordered})
+    _rows_cache["key"] = None  # force a re-read against the new stamp
+    return ok
+
+
+def _toggle_rows(names: List[str], hide: bool) -> Optional[str]:
+    """``/svprogress hide|show <names>``. Returns a message, or None on a bad name."""
+    targets = []
+    for name in names:
+        key = _normalize_row(name)
+        if key is None:
+            return f"savvy-progress: unknown row '{name}'. Rows: " + ", ".join(ROW_KEYS)
+        targets.append(key)
+
+    current = set(_hidden_rows())
+    if hide:
+        current.update(targets)
+    else:
+        current.difference_update(targets)
+    _write_hidden_rows(list(current))
+
+    state = "hidden" if hide else "shown"
+    return f"savvy-progress: {state} {', '.join(targets)}"
+
+
+def _rows_summary() -> str:
+    hidden = set(_hidden_rows())
+    shown = [key for key in ROW_KEYS if key not in hidden]
+    parts = [f"savvy-progress rows  shown: {', '.join(shown) or 'none'}"]
+    if hidden:
+        parts.append(f"hidden: {', '.join(k for k in ROW_KEYS if k in hidden)}")
+    parts.append("toggle: /svprogress hide <row>…  |  show <row>…  |  reset")
+    return "\n  ".join(parts)
+
+
+def _blank_agent(name: str) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "tokens": 0,
+        "input": 0,
+        "cache_read": 0,
+        "output": 0,
+        "cost_usd": 0.0,
+        "cost_source": "none",
+        "unpriced": False,
+        "sessions": 0,
+        "models": [],
+        "available": False,
+    }
+
+
+def _agent_model() -> Dict[str, Any]:
+    return {"tokens": 0, "input": 0, "cache_read": 0, "output": 0,
+            "cost_usd": 0.0, "cost_source": "none", "calls": 0}
+
+
+def _agent_cost(model: str, fresh_in: int, cache_read: int, tokens_out: int,
+                reported: float = 0.0) -> Tuple[float, str]:
+    """``(cost_usd, cost_source)`` for one agent model.
+
+    ``reported`` wins when the agent billed something itself. Otherwise the shared price
+    table is used. A cache-write token has no rate in that table, so callers pass it as
+    fresh input: the estimate stays conservative and, unlike an invented rate, checkable.
+    """
+    if reported > 0.0:
+        return reported, "provider"
+
+    price = _match_price(model) if model else None
+    if price is None:
+        return 0.0, "none"
+
+    price_in, price_out, price_cache = price
+    cost = (
+        (fresh_in / 1_000_000.0) * price_in
+        + (cache_read / 1_000_000.0) * price_cache
+        + (tokens_out / 1_000_000.0) * price_out
+    )
+    return cost, "table"
+
+
+def _combine_cost_sources(sources: Any) -> str:
+    """One source for a mixed set of rows. Any estimate makes the total an estimate."""
+    seen = {str(s) for s in sources if str(s) in ("provider", "table")}
+    if "table" in seen:
+        return "table"
+    if "provider" in seen:
+        return "provider"
+    return "none"
+
+
+def _iter_lines(path: Path) -> Iterator[str]:
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.strip():
+                yield line
+
+
+def _scan_codex_file(path: Path) -> Optional[Dict[str, Any]]:
+    """One codex rollout. ``token_count`` carries the session's running total."""
+    usage: Optional[Dict[str, Any]] = None
+    model = ""
+    try:
+        for line in _iter_lines(path):
+            if '"token_count"' in line:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                payload = event.get("payload") if isinstance(event, dict) else None
+                info = payload.get("info") if isinstance(payload, dict) else None
+                totals = info.get("total_token_usage") if isinstance(info, dict) else None
+                if isinstance(totals, dict):
+                    usage = totals
+            elif '"model"' in line:
+                match = _MODEL_KEY_RE.search(line)
+                if match:
+                    model = match.group(1).strip()
+    except OSError:
+        return None
+
+    if not usage:
+        return None
+
+    gross_in = max(0, _int_value(usage.get("input_tokens")))
+    cache_read = min(gross_in, max(0, _int_value(usage.get("cached_input_tokens"))))
+    fresh_in = max(0, gross_in - cache_read)
+    tokens_out = max(0, _int_value(usage.get("output_tokens")))
+    total = max(0, _int_value(usage.get("total_tokens"))) or (gross_in + tokens_out)
+    cost, source = _agent_cost(model, fresh_in, cache_read, tokens_out)
+
+    row = _agent_model()
+    row.update({"tokens": total, "input": fresh_in, "cache_read": cache_read,
+                "output": tokens_out, "cost_usd": cost, "cost_source": source, "calls": 1})
+    return {"tally": row, "models": {model or "unknown": row}}
+
+
+def _scan_pi_file(path: Path) -> Optional[Dict[str, Any]]:
+    """One pi session log. Every assistant message carries its own usage and cost."""
+    models: Dict[str, Dict[str, Any]] = {}
+    try:
+        for line in _iter_lines(path):
+            if '"usage"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            message = entry.get("message") if isinstance(entry, dict) else None
+            usage = message.get("usage") if isinstance(message, dict) else None
+            if not isinstance(message, dict) or not isinstance(usage, dict):
+                continue
+
+            outer = entry if isinstance(entry, dict) else {}
+            model = str(message.get("model") or outer.get("model") or "unknown")
+            fresh_in = max(0, _int_value(usage.get("input")))
+            cache_read = max(0, _int_value(usage.get("cacheRead")))
+            # No cache-write rate exists in the table, so a write is priced as input.
+            fresh_in += max(0, _int_value(usage.get("cacheWrite")))
+            tokens_out = max(0, _int_value(usage.get("output")))
+            reported = usage.get("cost") if isinstance(usage.get("cost"), dict) else {}
+            cost, source = _agent_cost(model, fresh_in, cache_read, tokens_out,
+                                       _finite(reported.get("total")))
+
+            row = models.setdefault(model, _agent_model())
+            row["tokens"] += fresh_in + cache_read + tokens_out
+            row["input"] += fresh_in
+            row["cache_read"] += cache_read
+            row["output"] += tokens_out
+            row["cost_usd"] += cost
+            row["calls"] += 1
+            row["cost_source"] = _combine_cost_sources([row["cost_source"], source])
+    except OSError:
+        return None
+
+    if not models:
+        return None
+
+    tally = _agent_model()
+    for row in models.values():
+        for key in ("tokens", "input", "cache_read", "output", "calls"):
+            tally[key] += row[key]
+        tally["cost_usd"] += row["cost_usd"]
+        tally["cost_source"] = _combine_cost_sources([tally["cost_source"], row["cost_source"]])
+    return {"tally": tally, "models": models}
+
+
+def _scan_dsh_file(path: Path) -> Optional[Dict[str, Any]]:
+    """One dsh session, decompressed with the ``zstd`` binary.
+
+    The usage chunk carries input, output and cache-read tokens but no cost, so dsh cost
+    is always a table estimate. No ``zstd`` binary means no dsh numbers, never a guess.
+    """
+    if not _ZSTD_BIN:
+        return None
+
+    try:
+        proc = subprocess.run(
+            [_ZSTD_BIN, "-dc", str(path)],
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+
+    models: Dict[str, Dict[str, Any]] = {}
+    model = ""
+    for raw in proc.stdout.decode("utf-8", "replace").splitlines():
+        if not raw.strip():
+            continue
+        if '"source"' in raw and '"model"' in raw:
+            match = _MODEL_KEY_RE.search(raw)
+            if match:
+                model = match.group(1).strip()
+            continue
+        if '"usage"' not in raw:
+            continue
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            continue
+        chunk = (event.get("data") or {}).get("chunk") if isinstance(event, dict) else None
+        if not isinstance(chunk, dict) or chunk.get("type") != "usage":
+            continue
+        usage = chunk.get("usage") or {}
+        if not isinstance(usage, dict):
+            continue
+
+        fresh_in = max(0, _int_value(usage.get("inputTokens")))
+        cache_read = max(0, _int_value(usage.get("cacheReadTokens")))
+        tokens_out = max(0, _int_value(usage.get("outputTokens")))
+        cost, source = _agent_cost(model, fresh_in, cache_read, tokens_out)
+
+        row = models.setdefault(model or "unknown", _agent_model())
+        row["tokens"] += max(0, _int_value(usage.get("totalTokens"))) or (
+            fresh_in + cache_read + tokens_out
+        )
+        row["input"] += fresh_in
+        row["cache_read"] += cache_read
+        row["output"] += tokens_out
+        row["cost_usd"] += cost
+        row["calls"] += 1
+        row["cost_source"] = _combine_cost_sources([row["cost_source"], source])
+
+    if not models:
+        return None
+
+    tally = _agent_model()
+    for row in models.values():
+        for key in ("tokens", "input", "cache_read", "output", "calls"):
+            tally[key] += row[key]
+        tally["cost_usd"] += row["cost_usd"]
+        tally["cost_source"] = _combine_cost_sources([tally["cost_source"], row["cost_source"]])
+    return {"tally": tally, "models": models}
+
+
+_SCANNERS = {"codex": _scan_codex_file, "pi": _scan_pi_file, "dsh": _scan_dsh_file}
+
+
+def _agent_root(env_name: str, rel: str) -> Path:
+    override = os.environ.get(env_name, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path(os.path.expanduser("~")) / rel
+
+
+def _agent_files(root: Path, glob: str) -> List[Path]:
+    if not root.is_dir():
+        return []
+    try:
+        return sorted(root.rglob(glob))[:AGENTS_MAX_FILES]
+    except OSError:
+        return []
+
+
+def _scan_agent(name: str, env_name: str, rel: str, glob: str) -> Dict[str, Any]:
+    """Totals for one agent. Never raises: a bad tree yields an empty, honest entry."""
+    entry = _blank_agent(name)
+    scanner = _SCANNERS.get(name)
+    files = _agent_files(_agent_root(env_name, rel), glob)
+    if not scanner or not files or (name == "dsh" and not _ZSTD_BIN):
+        return entry
+
+    entry["available"] = True
+    models: Dict[str, Dict[str, Any]] = {}
+    for path in files:
+        try:
+            parsed = scanner(path)
+        except Exception as exc:  # noqa: BLE001 — one bad transcript is not the whole agent
+            logger.debug("savvy-progress: %s file skipped (%s): %s", name, path, exc)
+            continue
+        if not parsed:
+            continue
+        tally = parsed["tally"]
+        entry["sessions"] += 1
+        for key in ("tokens", "input", "cache_read", "output"):
+            entry[key] += tally[key]
+        entry["cost_usd"] += tally["cost_usd"]
+        for model, row in parsed["models"].items():
+            merged = models.setdefault(model, _agent_model())
+            for key in ("tokens", "input", "cache_read", "output", "calls"):
+                merged[key] += row[key]
+            merged["cost_usd"] += row["cost_usd"]
+            merged["cost_source"] = _combine_cost_sources(
+                [merged["cost_source"], row["cost_source"]]
+            )
+
+    entry["cost_usd"] = round(entry["cost_usd"], 6)
+    entry["unpriced"] = any(row["cost_source"] == "none" for row in models.values())
+    entry["cost_source"] = _combine_cost_sources(
+        row["cost_source"] for row in models.values()
+    )
+    entry["models"] = [
+        {"model": model, **{k: v for k, v in row.items()}}
+        for model, row in sorted(models.items(), key=lambda kv: -kv[1]["tokens"])
+    ]
+    return entry
+
+
+def _others_payload(agents: List[Dict[str, Any]], now: float) -> Dict[str, Any]:
+    total_cost = round(sum(_finite(a.get("cost_usd")) for a in agents), 6)
+    return {
+        "ts": round(now, 3),
+        "agents": agents,
+        "tokens": sum(max(0, _int_value(a.get("tokens"))) for a in agents),
+        "cost_usd": total_cost,
+        "cost_source": _combine_cost_sources(a.get("cost_source") for a in agents),
+        "unpriced": any(bool(a.get("unpriced")) for a in agents),
+    }
+
+
+def _scan_others(now: float) -> Dict[str, Any]:
+    return _others_payload(
+        [_scan_agent(name, env_name, rel, glob) for name, env_name, rel, glob in AGENT_SOURCES],
+        now,
+    )
+
+
+def _others_path() -> Path:
+    return _hermes_home() / "state" / AGENTS_CACHE_NAME
+
+
+def _read_others_cache(now: float) -> Optional[Dict[str, Any]]:
+    try:
+        raw = json.loads(_others_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("agents"), list):
+        return None
+    age = now - _finite(raw.get("ts"))
+    if not (0.0 <= age < AGENTS_CACHE_S):
+        return None
+    return raw
+
+
+def _others_totals(now: Optional[float] = None, block: bool = False) -> Dict[str, Any]:
+    """Cross-agent totals.
+
+    ``block=False`` is the hook path: it never waits for a scan. The card can not afford a
+    cold ``~0.6 s`` read of every sibling transcript on the first tool call, so a stale or
+    missing cache returns the previous numbers and one background thread refreshes them
+    (single-flight; a second caller returns at once). ``block=True`` is the slash-command
+    path, where the user is waiting for a printout anyway.
+
+    ``SAVVY_AGENTS_OFF=1`` disables the scan entirely.
+    """
+    global _others_refreshing
+
+    now = time.time() if now is None else now
+    off = os.environ.get(AGENTS_OFF_ENV, "").strip().lower()
+    if off not in ("", "0", "false", "no"):
+        return _others_payload([_blank_agent(name) for name, *_rest in AGENT_SOURCES], now)
+
+    cached = _others_cache.get("value")
+    if isinstance(cached, dict) and 0.0 <= now - float(_others_cache.get("ts") or 0.0) < AGENTS_CACHE_S:
+        return cached
+
+    value = _read_others_cache(now)
+    if value is not None:
+        _others_cache["ts"] = now
+        _others_cache["value"] = value
+        return value
+
+    if block:
+        value = _refresh_others(now)
+        if value is not None:
+            return value
+        return _others_payload([_blank_agent(name) for name, *_rest in AGENT_SOURCES], now)
+
+    with _others_lock:
+        if _others_refreshing:
+            return _stale_others(now)
+        _others_refreshing = True
+
+    thread = threading.Thread(target=_background_scan, daemon=True,
+                              name="savvy-progress-agents")
+    thread.start()
+    return _stale_others(now)
+
+
+def _stale_others(now: float) -> Dict[str, Any]:
+    """The last known cross-agent numbers, or zeros when nothing has been read yet."""
+    cached = _others_cache.get("value")
+    if isinstance(cached, dict):
+        return cached
+    return _others_payload([_blank_agent(name) for name, *_rest in AGENT_SOURCES], now)
+
+
+def _refresh_others(now: float) -> Optional[Dict[str, Any]]:
+    """Scan, cache and persist. Returns the payload, or None when the scan itself failed."""
+    try:
+        value = _scan_others(now)
+    except Exception as exc:  # noqa: BLE001 — a hook must never break the turn
+        logger.debug("savvy-progress: cross-agent scan failed: %s", exc)
+        return None
+
+    _others_cache["ts"] = now
+    _others_cache["value"] = value
+    try:
+        _write_json_atomic(_others_path(), value)
+    except Exception as exc:  # noqa: BLE001 — a cache write is best effort
+        logger.debug("savvy-progress: cross-agent cache not written: %s", exc)
+    return value
+
+
+def _background_scan() -> None:
+    global _others_refreshing
+
+    try:
+        _refresh_others(time.time())
+    finally:
+        with _others_lock:
+            _others_refreshing = False
+
+
 def _build_snapshot(
     session_id: str,
     prev: Optional[Dict[str, Any]],
@@ -1500,6 +2060,8 @@ def _build_snapshot(
     day = _day_spend(now)
     burn_usd_per_hour, _elapsed_s = _burn_rate(total_cost, _read_session_start(primary_id), now)
     cache_saved, cache_saved_source = _cache_saved_usd(model, primary["cache_read"])
+    # Cross-agent spend is cached for a minute; the call is cheap on every other hook.
+    others = _others_totals(now)
 
     payload = {
         "ts": round(now, 3),
@@ -1542,6 +2104,17 @@ def _build_snapshot(
         "day_output_tokens": day["output_tokens"],
         "day_cache_read": day["cache_read"],
         "day_cache_write": day["cache_write"],
+        # Spend outside Hermes: codex, pi and dsh read from their own transcripts. Zeros
+        # when a tree is missing, never an error, and `others_unpriced` marks a total that
+        # leaves an unpriced model out of its cost.
+        "others": others["agents"],
+        "others_tokens": others["tokens"],
+        "others_cost_usd": others["cost_usd"],
+        "others_source": others["cost_source"],
+        "others_unpriced": others["unpriced"],
+        "others_ts": others["ts"],
+        # Rows the user switched off. The widget drops them; the card skips their lines.
+        "hidden_rows": _hidden_rows(),
     }
     new_entry = {
         "turn": turn,
@@ -1555,7 +2128,9 @@ def _build_snapshot(
 def _unchanged(prev: Optional[Dict[str, Any]], payload: Dict[str, Any]) -> bool:
     if not prev:
         return False
-    keys = [k for k in payload if k != "ts"]
+    # ``ts`` and ``others_ts`` are freshness stamps, not content: a scan timestamp that
+    # moves on its own must not rewrite the file the widget polls.
+    keys = [k for k in payload if k not in ("ts", "others_ts")]
     return all(prev.get(k) == payload.get(k) for k in keys)
 
 
@@ -1781,6 +2356,109 @@ def _compact_tokens(value: Any) -> str:
     return str(int(amount))
 
 
+def _agent_cell(value: Any, width: int) -> str:
+    """One fixed card cell: a string cut to ``width`` with a single-cell ellipsis."""
+    body = str(value if value is not None else "")
+    if len(body) > width:
+        return body[: max(1, width - 1)] + "…"
+    return body.ljust(width)
+
+
+def _agent_cost_cell(cost: Any, source: str, unpriced: bool) -> str:
+    """``$n/a``, ``$1.5040``, ``~$1.5040``; a ``?`` marks a priced-total that leaves an
+    unpriced model out. ``$n/a?`` would say the same thing twice, so it never appears."""
+    value, _suffix = _cost_text(cost, source)
+    if unpriced and source != "none":
+        return value + "?"
+    return value
+
+
+def _agent_row(label: str, model: Any, tokens: Any, cost: Any, source: str,
+               unpriced: bool) -> str:
+    """One 42-cell row of the other-agents block, aligned with the rest of the card.
+
+    ``tokens`` and ``cost`` may be ``None`` for a spacer row: the cells stay blank so the
+    columns do not move.
+    """
+    token_cell = "" if tokens is None else _compact_tokens(tokens).rjust(6)
+    cost_cell = "" if cost is None else _agent_cost_cell(cost, source, unpriced).rjust(10)
+    return (
+        f"  {_agent_cell(label, 8)}"
+        f"{_agent_cell(model, 16)}"
+        f"{token_cell:<6}"
+        f"{cost_cell:<10}"
+    )[:CARD_W]
+
+
+def _agent_model_tail(model: Any) -> str:
+    """Last path segment of a model id: ``deepseek-ai/DeepSeek-V4.1-Flash`` reads as
+    ``DeepSeek-V4.1-Flash``. A long tail is cut in the row, not here."""
+    text = str(model or "?").strip()
+    return text.split("/")[-1] or text
+
+
+def _others_lines(payload: Dict[str, Any], hidden: Any = None) -> List[str]:
+    """The cross-agent block: one row per agent, its top models, then the combined total.
+
+    An agent with no readable transcript is skipped, so a tree that does not exist on this
+    machine cannot print a fake zero. ``?`` after a cost means at least one of its models
+    has no price in the table, and that part is left out of the money.
+    """
+    entries = payload.get("others")
+    entries = entries if isinstance(entries, list) else []
+    if not entries:
+        return []
+
+    skip = {str(key) for key in (hidden or ())}
+    if "others" in skip:
+        return []
+
+    lines: List[str] = []
+    reachable = 0
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("available"):
+            continue
+        if str(entry.get("name") or "") in skip:
+            continue
+        reachable += 1
+        source = str(entry.get("cost_source") or "none")
+        if source not in ("provider", "table", "none"):
+            source = "none"
+        unpriced = bool(entry.get("unpriced"))
+        models = [m for m in (entry.get("models") or []) if isinstance(m, dict)]
+        lines.append(
+            _agent_row(str(entry.get("name") or "?"),
+                       f"{len(models)} model{'s' if len(models) != 1 else ''}",
+                       entry.get("tokens"), entry.get("cost_usd"), source, unpriced)
+        )
+
+        for model in models[:AGENT_MODEL_ROWS]:
+            model_source = str(model.get("cost_source") or "none")
+            if model_source not in ("provider", "table", "none"):
+                model_source = "none"
+            lines.append(
+                _agent_row("", "· " + _agent_model_tail(model.get("model")), model.get("tokens"),
+                           model.get("cost_usd"), model_source,
+                           model_source == "none")
+            )
+        extra = len(models) - AGENT_MODEL_ROWS
+        if extra > 0:
+            lines.append(_agent_row("", f"· +{extra} more", None, None, "none", False))
+
+    if not reachable:
+        # Nothing to say: a header over "no transcripts" only pushes the card down.
+        return []
+
+    source = str(payload.get("others_source") or "none")
+    if source not in ("provider", "table", "none"):
+        source = "none"
+    lines.append(
+        _agent_row(f"total {reachable}", "all models", payload.get("others_tokens"),
+                   payload.get("others_cost_usd"), source, bool(payload.get("others_unpriced")))
+    )
+    return lines
+
+
 def render_card(payload: Dict[str, Any]) -> str:
     """The /svprogress card: plain rows, aligned values, no JSON.
 
@@ -1841,6 +2519,14 @@ def render_card(payload: Dict[str, Any]) -> str:
     else:
         agents_row = _row("agents", "none")
 
+    hidden = set()
+    for name in (payload.get("hidden_rows") or []):
+        key = _normalize_row(name)
+        if key:
+            hidden.add(key)
+
+    others_block = _others_lines(payload, hidden)
+
     ctx_tokens = max(0, _int_value(payload.get("context_tokens")))
     ctx_window = _int_value(payload.get("context_window"))
     if ctx_window <= 0:
@@ -1852,23 +2538,39 @@ def render_card(payload: Dict[str, Any]) -> str:
         f"   {ctx_pct:4.1f}%",
     )
 
-    lines = [
-        _header(payload.get("model"), payload.get("provider")),
-        rule,
-        primary_line,
-        _row("api calls", _thousands(payload.get("api_calls"))),
-        _row("input", _thousands(tokens_in), f"   ◐ {f'{hit:.1f}%'.rjust(5)}"),
-        _row("output", _thousands(payload.get("output_tokens"))),
-        _row("cache read", _thousands(cache_read)),
-        context_row,
-        _row("cost", cost_value, suffix),
-        _row("burn/hour", _rate_text(payload.get("burn_usd_per_hour"), source)),
-        _row("cache saved", saved_value, f"   {saved_suffix}" if saved_suffix else ""),
-        _row("today", day_value, day_tail),
-        _row("tokens/day", _thousands(payload.get("day_tokens"))),
-        agents_row,
-        rule,
-    ]
+    def shown(*keys: str) -> bool:
+        """True when at least one of ``keys`` is still on. Hidden rows draw nothing."""
+        return not any(key in hidden for key in keys)
+
+    body: List[str] = [primary_line]
+    if shown("api"):
+        body.append(_row("api calls", _thousands(payload.get("api_calls"))))
+    if shown("tokens"):
+        body.extend([
+            _row("input", _thousands(tokens_in), f"   ◐ {f'{hit:.1f}%'.rjust(5)}"),
+            _row("output", _thousands(payload.get("output_tokens"))),
+            _row("cache read", _thousands(cache_read)),
+        ])
+    if shown("tokens", "cache"):
+        body.append(context_row)
+    if shown("cost"):
+        body.append(_row("cost", cost_value, suffix))
+    if shown("burn"):
+        body.append(_row("burn/hour", _rate_text(payload.get("burn_usd_per_hour"), source)))
+    if shown("saved"):
+        body.append(_row("cache saved", saved_value, f"   {saved_suffix}" if saved_suffix else ""))
+    if shown("today"):
+        body.append(_row("today", day_value, day_tail))
+    if shown("daytok"):
+        body.append(_row("tokens/day", _thousands(payload.get("day_tokens"))))
+    if shown("agents"):
+        body.append(agents_row)
+    if others_block:
+        body.extend(others_block)
+
+    lines = [_header(payload.get("model"), payload.get("provider")), rule]
+    lines.extend(body)
+    lines.append(rule)
 
     turns_raw = payload.get("turns")
     turns = (
@@ -1893,13 +2595,45 @@ def render_card(payload: Dict[str, Any]) -> str:
 
 
 def _cmd_progress(raw_args: str = "", *args: Any, **kwargs: Any) -> str:
-    """``/svprogress`` handler: print the session card, never JSON, never a traceback."""
+    """``/svprogress`` handler: print the session card, never JSON, never a traceback.
+
+    Subcommands, one per row shown above:
+      ``/svprogress hide burn codex``   stop drawing those rows
+      ``/svprogress show burn``         draw them again
+      ``/svprogress reset``             draw every row
+      ``/svprogress rows``              print which rows are shown or hidden
+    """
     try:
+        words = str(raw_args or "").replace(",", " ").split()
+        verb = words[0].lower() if words else ""
+        names = words[1:]
+
+        if verb in ("hide", "off", "mute") and names:
+            return _toggle_rows(names, True)
+        if verb in ("show", "on", "unmute") and names:
+            return _toggle_rows(names, False)
+        if verb in ("reset", "all", "clear"):
+            _write_hidden_rows([])
+            return "savvy-progress: every row shown"
+        if verb in ("rows", "list"):
+            return _rows_summary()
+        if verb in ("hide", "off", "mute", "show", "on", "unmute"):
+            return _rows_summary()
+    except Exception as exc:
+        logger.debug("savvy-progress: row toggle failed: %s", exc)
+        return UNAVAILABLE
+
+    try:
+        # The user is waiting for a printout, so this is the one place a cold scan is
+        # allowed to block. Every later hook reads the warm cache.
+        _others_totals(block=True)
         payload = snapshot(_primary_session_id() or "")
         if not isinstance(payload, dict):
             payload = _read_prev(_snapshot_path())
         if not isinstance(payload, dict):
             return NO_DATA
+        payload = dict(payload)
+        payload["hidden_rows"] = _hidden_rows()
         return render_card(payload)
     except Exception as exc:
         logger.debug("savvy-progress: /svprogress failed: %s", exc)

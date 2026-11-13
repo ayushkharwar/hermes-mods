@@ -18,6 +18,10 @@ burn                  ~$0.24/h
 saved                 ~$1.9864
 today       ~$2.2493  22 chats
 tok/day              48.7M
+codex        $n/a   21.6M?
+pi        ~$1.6343 111.3M
+dsh       ~$3.0715  93.8M
+others    ~$4.7058 226.8M
 agents                    none
 ```
 
@@ -41,6 +45,62 @@ miscount. DST is handled by asking `mktime` for the next midnight.
 | `today` | Every session started today, from local 00:00 to 24:00, with its session count, so cron runs and parallel terminals cannot hide |
 | `tok/day` | Tokens today across every session: `input_tokens + cache_read_tokens + cache_write_tokens + output_tokens`. Cached prompts are counted, because they still went through the model |
 | `agents` | Delegate children of the tracked session and their added cost |
+| `codex` | Spend and tokens in the local codex transcripts, cost then token total |
+| `pi` | Same for pi sessions (`~/.pi/agent/sessions`) |
+| `dsh` | Same for DeepSeek Harness sessions (`~/.dsh/sessions`, read through `zstd`) |
+| `others` | The three rows above combined: money spent outside Hermes, and total tokens |
+
+## Other agents
+
+The card can see the spend of three sibling agents, because each one writes its own
+transcript on this machine:
+
+| Agent | Source | Token rule | Cost rule |
+| --- | --- | --- | --- |
+| codex | `~/.codex/sessions/**/*.jsonl` | last `token_count.info.total_token_usage` per rollout | price table, else `n/a` |
+| pi | `~/.pi/agent/sessions/**/*.jsonl` | every `message.usage` row | the agent's own reported cost, else the price table |
+| dsh | `~/.dsh/sessions/**/session.jsonl.zstd` | every `assistant/chunk` usage chunk | price table, else `n/a` |
+
+A `?` after a cost means at least one model in that row has no price in the table, and that
+part is left out of the money instead of being called free. A model the agent bills itself
+(pi reports cost per response) always wins over the table.
+
+The scan costs about 0.4 s over the full history, so the hook never waits for it: a stale
+cache returns the previous numbers and one background thread refreshes them. `/svprogress`
+waits, because you asked for a printout. Results are cached in
+`$HERMES_HOME/state/savvy-progress.agents.json` for 60 s. Set `SAVVY_AGENTS_OFF=1` to skip
+the scan entirely.
+
+### `/svprogress` rows
+
+The slash card prints one line per agent plus its top three models and the combined total:
+
+```
+  other agents
+  pi      3 models          1.0M ~$0.5500?
+          · deepseek-v4.1…  1.0M ~$0.3000
+          · paid-model        15 ~$0.2500
+          · Spark-X2.6-4B…   713      $n/a
+  total 3 all models      2.0M ~$0.8500?
+```
+
+## Hiding rows
+
+Every row can be switched off. The list lives in
+`$HERMES_HOME/state/savvy-progress.rows.json` (`{"hidden": ["burn", "codex"]}`), so it
+survives a restart and one edit does the same thing as the command:
+
+| Command | Effect |
+| --- | --- |
+| `/svprogress hide burn codex` | Stop drawing those rows |
+| `/svprogress show burn` | Draw them again |
+| `/svprogress reset` | Draw every row |
+| `/svprogress rows` | Print which rows are shown and hidden |
+
+Row names are the widget keys: `model`, `api`, `tokens`, `cache`, `ctx`, `cost`, `burn`,
+`saved`, `today`, `daytok`, `codex`, `pi`, `dsh`, `others`, `agents`. `tokens` hides input,
+output and cache-read together. The spoken labels work too (`tok/day`, `delegates`,
+`context`, `calls`). A hidden row draws no line, no blank gap and no zero.
 
 `cost_source` travels with each number: `provider` is a real billed figure, `table` is an
 estimate from list prices, `none` means there is no honest number and the row prints `n/a`.
@@ -78,6 +138,9 @@ changes, and defaulting to 1,000,000.
 | State directory read-only, or a parent path is a file | The write is skipped, the previous snapshot stays valid, the hook returns normally |
 | `Infinity` / `NaN` in a cost field | Sanitised before serialisation; the file always parses as strict JSON |
 | Two Hermes processes firing at once | An advisory `flock` plus an atomic `os.replace`; a busy lock skips one write instead of interleaving |
+| A codex, pi or dsh tree missing or unreadable | That agent reports `available: false`, contributes zero tokens, and is skipped on the card |
+| Cross-agent scan slower than the turn | The hook returns the previous numbers and one background thread refreshes them; the scan is single-flight |
+| `zstd` not installed | dsh reports no data; no transcript is guessed |
 | Unpriced model | Rows print `n/a` instead of inventing a dollar figure |
 | Missing `started_at` | Burn reports 0 instead of dividing by the epoch |
 | Hostile payload (list where a count belongs) | Coerced to 0, the card still renders |

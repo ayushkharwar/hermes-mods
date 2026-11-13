@@ -23,6 +23,9 @@ ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_DIR = ROOT / "plugins" / "savvy-progress"
 GOLDEN = Path(__file__).resolve().parent / "golden_single_session.json"
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+# This suite owns no codex/pi/dsh tree, so the cross-agent scan stays off and the six
+# other-agent keys are asserted with their zero shape instead of this machine's spend.
+os.environ.setdefault("SAVVY_AGENTS_OFF", "1")
 DB = HERMES_HOME / "state.db"
 
 # The 14 keys of the pre-change contract. They must keep their exact meaning.
@@ -70,7 +73,19 @@ DAY_TOKEN_KEYS = {
     "day_cache_read",
     "day_cache_write",
 }
-CONTRACT_KEYS = BASE_KEYS | NEW_KEYS | SPEND_KEYS | DAY_TOKEN_KEYS
+# The six keys behind the other-agent rows (codex / pi / dsh), added on the
+# experiment/cross-agent-spend branch.
+OTHER_KEYS = {
+    "others",
+    "others_tokens",
+    "others_cost_usd",
+    "others_source",
+    "others_unpriced",
+    "others_ts",
+    # The row-toggle list the widget filters on (same branch).
+    "hidden_rows",
+}
+CONTRACT_KEYS = BASE_KEYS | NEW_KEYS | SPEND_KEYS | DAY_TOKEN_KEYS | OTHER_KEYS
 DELEGATE_KEYS = {"count", "input_tokens", "output_tokens", "cache_read", "cost_usd", "cost_source"}
 
 COST_SOURCES = {"provider", "table", "none"}
@@ -720,7 +735,7 @@ def main() -> int:
             payload = fire(plugin, "golden-A")
             shapes.append(set(payload))
             run.append({k: v for k, v in payload.items() if k in BASE_KEYS and k != "ts"})
-    check("contract size matches the key set", len(CONTRACT_KEYS) == 32, f"n={len(CONTRACT_KEYS)}")
+    check("contract size matches the key set", len(CONTRACT_KEYS) == 39, f"n={len(CONTRACT_KEYS)}")
     check(f"every single-session payload has exactly the {len(CONTRACT_KEYS)} contract keys",
           all(shape == CONTRACT_KEYS for shape in shapes),
           f"n_keys={[len(s) for s in shapes]}")

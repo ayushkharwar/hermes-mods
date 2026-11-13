@@ -6,7 +6,7 @@
  * overflow, garbage, and file-level cases (missing, malformed, one chat).
  * Run: node test_widget.mjs
  */
-import { buildRows, formatCost, formatBurn, formatSaved, formatToday, formatAgents, readSnapshot, mergeSnapshot, formatAge, staleLabel } from '../../tui-widgets/savvy-progress.mjs'
+import { buildRows, formatCost, formatBurn, formatSaved, formatToday, formatAgents, formatAgent, readSnapshot, mergeSnapshot, formatAge, staleLabel } from '../../tui-widgets/savvy-progress.mjs'
 import register from '../../tui-widgets/savvy-progress.mjs'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -47,7 +47,7 @@ function rowsOf(snapshot) {
 
 function assertRows(name, snapshot, expectations = {}) {
   const rows = rowsOf(snapshot)
-  check(`${name}: row count`, rows.length === 10, String(rows.length))
+  check(`${name}: row count`, rows.length === 14, String(rows.length))
   for (const row of rows) {
     const key = row.props?.key
     const text = textOf(row)
@@ -136,6 +136,38 @@ check('formatToday one', formatToday(0.5, 'provider', 1) === ' $0.5000  1 chat'.
 check('formatCost still 8 cells', formatCost(0.0123, 'table').length === 8)
 check('formatAgents none width', formatAgents({ count: 0 }).length === VALUE_W)
 
+// 9b. other-agent rows: cost + tokens, `none` when absent, `?` on an unpriced part
+check('formatAgent none width', formatAgent(null).length === VALUE_W)
+check('formatAgent none text', formatAgent(null).trim() === 'none', JSON.stringify(formatAgent(null)))
+check('formatAgent tokens only', formatAgent({ tokens: 21631256, cost_usd: 0, cost_source: 'none', unpriced: true }).trim() === '$n/a 21.6M', JSON.stringify(formatAgent({ tokens: 21631256, cost_usd: 0, cost_source: 'none', unpriced: true })))
+check('formatAgent priced width', formatAgent({ tokens: 111347005, cost_usd: 1.6343, cost_source: 'table', unpriced: true }).length === VALUE_W)
+check('formatAgent priced marks estimate', formatAgent({ tokens: 111347005, cost_usd: 1.6343, cost_source: 'table', unpriced: true }).trim().startsWith('~$1.6343?'), JSON.stringify(formatAgent({ tokens: 111347005, cost_usd: 1.6343, cost_source: 'table', unpriced: true })))
+check('formatAgent zero is none', formatAgent({ tokens: 0, cost_usd: 0, cost_source: 'none' }).trim() === 'none')
+const r9 = assertRows('others', { ...normal, others: [
+  { name: 'codex', tokens: 21631256, cost_usd: 0, cost_source: 'none', unpriced: true },
+  { name: 'pi', tokens: 111347005, cost_usd: 1.6343, cost_source: 'table', unpriced: true },
+  { name: 'dsh', tokens: 93826836, cost_usd: 3.0715, cost_source: 'table', unpriced: true }
+], others_tokens: 226805097, others_cost_usd: 4.7058, others_source: 'table', others_unpriced: true })
+check('others: codex row', r9.codex.includes('21.6M'), JSON.stringify(r9.codex))
+check('others: pi row', r9.pi.includes('111.3M'), JSON.stringify(r9.pi))
+check('others: total row', r9.others.includes('226.8M'), JSON.stringify(r9.others))
+const hiddenSet = buildRows(parts, { ...normal, hidden_rows: ['burn', 'saved', 'codex', 'pi', 'dsh'] }, t)
+check('hidden rows: five rows dropped', hiddenSet.length === 9, String(hiddenSet.length))
+check('hidden rows: no hidden key survives',
+  !hiddenSet.some(entry => ['burn', 'saved', 'codex', 'pi', 'dsh'].includes(entry.props.key)),
+  hiddenSet.map(entry => entry.props.key).join(','))
+check('hidden rows: the rest keep their width',
+  hiddenSet.every(entry => [...textOf(entry)].length === ROW_W),
+  hiddenSet.map(entry => [...textOf(entry)].length).join(','))
+check('hidden rows: every row hides',
+  buildRows(parts, { ...normal, hidden_rows: ['model', 'tokens', 'cache', 'ctx', 'cost', 'burn', 'saved', 'today', 'daytok', 'codex', 'pi', 'dsh', 'others', 'agents'] }, t).length === 0)
+check('hidden rows: unknown names are ignored',
+  buildRows(parts, { ...normal, hidden_rows: ['warp-drive'] }, t).length === 14)
+
+const r9b = assertRows('others-empty', { ...normal, others: [] })
+check('others-empty: codex none', r9b.codex.trim() === 'none', JSON.stringify(r9b.codex))
+check('others-empty: total none', r9b.others.trim() === 'none', JSON.stringify(r9b.others))
+
 // 10. file-level: missing file, malformed JSON, populated file
 const home = mkdtempSync(join(tmpdir(), 'savvy-widget-'))
 process.env.HERMES_HOME = home
@@ -211,7 +243,7 @@ check('register: card renders a Dialog', Boolean(tree) && tree.type === 'Dialog'
 check('register: dialog title PROGRESS', String(tree?.props?.title).startsWith('PROGRESS'), String(tree?.props?.title))
 check('register: dialog width 36', tree?.props?.width === 36, String(tree?.props?.width))
 const inner = tree?.kids?.[0]
-check('register: 10 rows inside', (inner?.kids || []).length === 10, String((inner?.kids || []).length))
+check('register: 14 rows inside', (inner?.kids || []).length === 14, String((inner?.kids || []).length))
 
 let oldSdkError = null
 try {
