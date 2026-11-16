@@ -121,6 +121,33 @@ WRITE_LOCK_TIMEOUT_S = 1.0
 # Optional price overrides, merged over PRICE_TABLE on every mtime change.
 PRICE_OVERRIDE_NAME = "savvy-progress.prices.json"
 
+# --- extras (experimental rows) -------------------------------------------------
+# One master switch for the six experimental rows (warn / miss / errors / week /
+# gradient gauge / tip). It lives in the theme state file beside `theme` and `sep`
+# and ships in the payload, so `/svprogress extras off` puts the card back to its
+# 18-row shape with one command and no other setting moves.
+EXTRAS_DEFAULT = True
+# The `warn` row raises below this blended day cache hit rate. The gauge itself keeps
+# its own 70 / 30 thresholds: the gauge grades, this row complains.
+WARN_CACHE_HIT_MIN = 90.0
+# Optional soft day budget in USD, read from the theme state file as `budget_usd`.
+# When the key is absent the budget check is skipped rather than guessed at.
+WARN_BUDGET_KEY = "budget_usd"
+# A snapshot older than this is not live data. Same window as STALE_S below (declared
+# there with the rest of the card geometry); repeated as a literal because this block is
+# read before that one.
+WARN_STALE_S = 300.0
+# Failure counters. Nothing in state.db records a failed call (see _errors_state), so
+# the plugin keeps its own in state, and says n/a when it has never seen a signal.
+ERRORS_NAME = "savvy-progress.errors.json"
+# Tip rotation period in seconds, overridable in the theme state file as `tip_s`.
+TIP_S_DEFAULT = 12.0
+# Days in the `week` sparkline: seven local calendar days, oldest left.
+WEEK_DAYS = 7
+# Block ramp for the plain-text sparkline. One cell each, no emoji, so both surfaces
+# print the same shape and the row keeps its fixed width.
+SPARK_RAMP = "▁▂▃▄▅▆▇█"
+
 # --- primary / delegate split ---------------------------------------------------
 # The card describes the user's own interactive session. Everything below it in the
 # parent chain is a delegate and is reported as an extra cost, never as the card.
@@ -143,13 +170,16 @@ PIN_TTL_S = 12 * 3600.0
 # A pinned session that ended more than 30 min ago must not hold the card.
 PIN_ENDED_STALE_S = 30 * 60.0
 
-# --- context bar -----------------------------------------------------------------
-# context_tokens is the biggest prompt this session has sent: one model row's
-# (input + cache read + cache write) divided by that row's api_call_count.
-DEFAULT_CONTEXT_WINDOW = 1_000_000
-_context_cache: Dict[str, Any] = {}
 _price_cache: Dict[str, Any] = {"key": None, "table": None}
+_price_match_cache: Dict[Tuple[Any, str], Optional[Tuple[float, float, float]]] = {}
 _day_cache: Dict[str, Any] = {"key": None, "value": None}
+# The two extras queries are cached the same few seconds as the day row: they are
+# called from every hook and each one scans session_model_usage.
+_miss_cache: Dict[str, Any] = {"key": None, "value": None}
+_week_cache: Dict[str, Any] = {"key": None, "value": None}
+# Failure counter, in memory first and mirrored to state so a restart keeps the count.
+_errors_cache: Dict[str, Any] = {"key": None, "count": 0, "signal": False}
+_errors_lock = threading.Lock()
 
 DELEGATE_DEFAULTS: Dict[str, Any] = {
     "count": 0,
@@ -293,17 +323,29 @@ GROUP BY session_id
 HAVING MAX(last_seen) >= ?
 """
 
-_CONTEXT_SQL = """
-SELECT MAX((input_tokens + cache_read_tokens + cache_write_tokens) /
-           CASE WHEN api_call_count > 0 THEN api_call_count ELSE 1 END)
-FROM session_model_usage
-WHERE session_id = ?
-"""
-
 # Day spend: every usage row whose session started inside the window. A session with a
 # null start falls back to its last activity, so an old chat that kept running still counts.
 _DAY_SQL = f"""
 SELECT u.model,
+       u.input_tokens,
+       u.output_tokens,
+       u.cache_read_tokens,
+       u.cache_write_tokens,
+       u.actual_cost_usd,
+       u.estimated_cost_usd,
+       u.session_id
+FROM session_model_usage u
+JOIN sessions s ON s.id = u.session_id
+WHERE COALESCE(NULLIF(s.started_at, 0), NULLIF(s.last_activity_at, 0), 0) >= ?
+  AND COALESCE(NULLIF(s.started_at, 0), NULLIF(s.last_activity_at, 0), 0) < ?
+LIMIT {DAY_ROW_LIMIT}
+"""
+
+# Seven-day trend for the `week` sparkline: the same session-day key the day row uses,
+# carried through so the bucket can be resolved against local calendar days here.
+_WEEK_SQL = f"""
+SELECT COALESCE(NULLIF(s.started_at, 0), NULLIF(s.last_activity_at, 0), 0) AS seen,
+       u.model,
        u.input_tokens,
        u.output_tokens,
        u.cache_read_tokens,
@@ -400,23 +442,41 @@ def _safe_row(sql: str, params: Tuple[Any, ...] = ()) -> Optional[Tuple[Any, ...
     return rows[0] if rows else None
 
 
-def _match_price(model: str) -> Optional[Tuple[float, float, float]]:
+def _match_price(
+    model: str,
+    table: Optional[Dict[str, Tuple[float, float, float]]] = None,
+) -> Optional[Tuple[float, float, float]]:
     """Price tuple for a model name, or None.
 
     Case-insensitive substring match, longest key first. An operator override outranks a
     baked row: if someone writes a rate for an alias, that rate applies to every model id
     containing the alias, because the override is the more specific statement of intent.
+
+    Memoised per (price-file stamp, model): the day row prices up to 50k usage rows, and a
+    fresh ``stat`` plus a sorted scan per row cost more than the whole query. A caller that
+    already holds the merged table passes it in and skips the stat too.
     """
+    tag = (_price_cache.get("key"), (model or "").lower())
+    if tag in _price_match_cache:
+        return _price_match_cache[tag]
+
     name = (model or "").lower()
     overrides = _override_table()
+    found: Optional[Tuple[float, float, float]] = None
     for key in sorted(overrides, key=len, reverse=True):
         if key in name:
-            return overrides[key]
-    table = _price_table()
-    for key in sorted(table, key=len, reverse=True):
-        if key in name:
-            return table[key]
-    return None
+            found = overrides[key]
+            break
+    if found is None:
+        prices = _price_table() if table is None else table
+        for key in sorted(prices, key=len, reverse=True):
+            if key in name:
+                found = prices[key]
+                break
+    if len(_price_match_cache) > 512:  # a runaway model list cannot grow without bound
+        _price_match_cache.clear()
+    _price_match_cache[tag] = found
+    return found
 
 
 def _load_price_overrides() -> Dict[str, Tuple[float, float, float]]:
@@ -503,6 +563,7 @@ def _resolve_cost(
     cache_read: int,
     actual: Any,
     estimated: Any,
+    table: Optional[Dict[str, Tuple[float, float, float]]] = None,
 ) -> Tuple[float, str]:
     """``(cost_usd, cost_source)`` for one usage row.
 
@@ -520,7 +581,7 @@ def _resolve_cost(
         if value > 0.0:
             return value, source
 
-    price = _match_price(model)
+    price = _match_price(model, table)
     if price is None:
         return 0.0, "none"
 
@@ -616,22 +677,6 @@ def _read_model(session_id: str) -> Tuple[str, str]:
     model = str(row[0] or "unknown")
     provider = str(row[1] or "").split(":")[0].strip()
     return model, provider
-
-
-def _read_context_tokens(session_id: str) -> int:
-    """Current prompt size of the session, in tokens.
-
-    ``input_tokens``, ``cache_read_tokens`` and ``cache_write_tokens`` are lifetime sums in
-    this schema, so their plain sum is the session's whole throughput, not its prompt: on a
-    long session it reads ~12x the 1M window. Dividing that sum by the row's
-    ``api_call_count`` gives the average prompt per call, and the max over rows is the
-    biggest prompt the session has sent. That is the number the TUI status bar tracks.
-    """
-    row = _safe_row(_CONTEXT_SQL, (session_id,))
-    try:
-        return max(0, int(row[0] or 0)) if row else 0
-    except (TypeError, ValueError):
-        return 0
 
 
 def _finite(value: Any, default: float = 0.0) -> float:
@@ -743,6 +788,9 @@ def _day_spend(now: float) -> Dict[str, Any]:
     if len(rows) >= DAY_ROW_LIMIT:
         logger.debug("savvy-progress: day spend hit the %d row cap", DAY_ROW_LIMIT)
 
+    # One price table for the whole day: a per-row lookup would re-stat the override file
+    # 50k times, which costs more than the query itself.
+    prices = _price_table()
     total = 0.0
     sources = set()
     sessions = set()
@@ -761,6 +809,7 @@ def _day_spend(now: float) -> Dict[str, Any]:
             int(r_cache or 0),
             actual,
             estimated,
+            prices,
         )
         total += row_cost
         sources.add(row_source)
@@ -783,60 +832,146 @@ def _day_spend(now: float) -> Dict[str, Any]:
         "cache_read": day_cache,
         "cache_write": day_cache_write,
         "tokens": day_in + day_out + day_cache + day_cache_write,
+        # Blended cache hit rate for the whole day: cached input against every billed
+        # input token. The `cache` row draws this, so one chat's cold start cannot make
+        # the day look worse than it was.
+        "cache_hit_pct": _cache_hit_pct(day_cache, day_in),
     }
     _day_cache["key"] = key
     _day_cache["value"] = dict(result)
     return dict(result)
 
 
-def _context_window() -> int:
-    """``model.context_length`` from ``config.yaml``. Never raises, never returns 0."""
-    path = _hermes_home() / "config.yaml"
+def _day_miss_usd(now: float) -> Dict[str, Any]:
+    """What a *perfect* cache would have saved today: the cache miss cost.
+
+    For every usage row of the local day the arithmetic is
+
+        input_tokens / 1e6 * (price_in - price_cache)
+
+    with `input_tokens` the FRESH (non-cached) input and the rates resolved by the
+    same :func:`_match_price` the `saved` row uses, so both rows move together when
+    the price table changes. It is an estimate of money not spent, never a bill, and
+    it is labelled with `~` exactly like `saved`.
+
+    cache_write_tokens are deliberately left out. They are the price of *creating*
+    the cache rather than of missing it, and the seeded table carries no write rate
+    at all, so charging one would be an invented number.
+
+    Returns `{"usd": float, "source": "table"|"none", "unpriced": bool, "rows": int}`.
+    """
+    start, end = _day_bounds(now)
+    bucket = int(now // DAY_CACHE_S)
     try:
-        key = (str(path), path.stat().st_mtime_ns)
+        db_stamp = _db_path().stat()
+        key = (bucket, round(start, 3), round(end, 3), db_stamp.st_mtime_ns, db_stamp.st_size)
     except OSError:
-        return DEFAULT_CONTEXT_WINDOW
+        key = (bucket, round(start, 3), round(end, 3), 0, 0)
+    if _miss_cache.get("key") == key and isinstance(_miss_cache.get("value"), dict):
+        return dict(_miss_cache["value"])  # type: ignore[arg-type]
 
-    if _context_cache.get("key") == key and _context_cache.get("value"):
-        return int(_context_cache["value"])
+    rows = _safe_rows(_DAY_SQL, (start, end))
+    prices = _price_table()
+    total = 0.0
+    priced = 0
+    unpriced = False
+    for model, r_in, _r_out, _r_cache, _r_cache_write, _actual, _estimated, _sid in rows:
+        price = _match_price(str(model or ""), prices)
+        if price is None:
+            unpriced = True
+            continue
+        price_in, _price_out, price_cache = price
+        total += (max(0, int(r_in or 0)) / 1_000_000.0) * max(0.0, price_in - price_cache)
+        priced += 1
 
-    window = DEFAULT_CONTEXT_WINDOW
+    result = {
+        "usd": round(_finite(total), 6),
+        "source": "table" if priced else "none",
+        "unpriced": unpriced,
+        "rows": len(rows),
+    }
+    _miss_cache["key"] = key
+    _miss_cache["value"] = dict(result)
+    return dict(result)
+
+
+def _week_spend(now: float) -> Dict[str, Any]:
+    """Seven local calendar days of spend, oldest first, for the `week` sparkline.
+
+    One grouped scan of session_model_usage over the window; the per-day split is done
+    here against :func:`_day_bounds` boundaries, so DST and a shifted midnight cannot
+    put a row in the wrong bucket. Pricing is :func:`_resolve_cost`, the same order
+    the day row uses (provider actual, provider estimate, then the price table).
+
+    Returns `{"days": [{"label","cost_usd","sessions"} x 7], "source", "total"}`. A day
+    with no rows is a real zero, not a gap: the sparkline keeps its seven cells.
+    """
+    start, end = _day_bounds(now)
+    window_start = start - (WEEK_DAYS - 1) * 86400.0
+    bucket = int(now // DAY_CACHE_S)
     try:
-        text = path.read_text(encoding="utf-8")
+        db_stamp = _db_path().stat()
+        key = (bucket, round(window_start, 3), round(end, 3), db_stamp.st_mtime_ns, db_stamp.st_size)
     except OSError:
-        text = ""
+        key = (bucket, round(window_start, 3), round(end, 3), 0, 0)
+    if _week_cache.get("key") == key and isinstance(_week_cache.get("value"), dict):
+        return dict(_week_cache["value"])  # type: ignore[arg-type]
 
-    if text:
-        parsed = None
+    # Local midnight boundaries for each of the seven days, oldest first. Recomputed
+    # from the calendar rather than by adding 86400, so a DST shift cannot drift them.
+    bounds: List[Tuple[float, float]] = []
+    for back in range(WEEK_DAYS - 1, -1, -1):
+        bounds.append(_day_bounds(start - back * 86400.0))
+
+    rows = _safe_rows(_WEEK_SQL, (bounds[0][0], bounds[-1][1]))
+    prices = _price_table()
+    costs = [0.0] * WEEK_DAYS
+    sessions: List[set] = [set() for _ in range(WEEK_DAYS)]
+    sources: set = set()
+    for seen, model, r_in, r_out, r_cache, _r_cache_write, actual, estimated, sid in rows:
         try:
-            import yaml  # noqa: PLC0415 — optional, the regex below is the fallback
-
-            data = yaml.safe_load(text)
-            if isinstance(data, dict):
-                model_block = data.get("model")
-                if isinstance(model_block, dict):
-                    parsed = model_block.get("context_length")
-        except Exception as exc:
-            logger.debug("savvy-progress: yaml parse failed, using the regex: %s", exc)
-
-        try:
-            candidate = int(parsed) if parsed is not None else 0
+            when = float(seen or 0.0)
         except (TypeError, ValueError):
-            candidate = 0
+            continue
+        index = -1
+        for position, (day_start, day_end) in enumerate(bounds):
+            if day_start <= when < day_end:
+                index = position
+                break
+        if index < 0:
+            continue
+        cost, source = _resolve_cost(
+            str(model or ""), int(r_in or 0), int(r_out or 0), int(r_cache or 0),
+            actual, estimated, prices,
+        )
+        costs[index] += cost
+        sessions[index].add(str(sid or ""))
+        sources.add(source)
 
-        if candidate <= 0:
-            match = re.search(r"^\s*context_length:\s*(\d+)\s*$", text, re.MULTILINE)
-            if match:
-                try:
-                    candidate = int(match.group(1))
-                except ValueError:
-                    candidate = 0
-        if candidate > 0:
-            window = candidate
+    if "provider" in sources:
+        source = "provider"
+    elif "table" in sources:
+        source = "table"
+    else:
+        source = "none"
 
-    _context_cache["key"] = key
-    _context_cache["value"] = window
-    return window
+    days: List[Dict[str, Any]] = []
+    for index, (day_start, _day_end) in enumerate(bounds):
+        days.append({
+            "label": time.strftime("%a", time.localtime(day_start + 60.0)),
+            "date": time.strftime("%Y-%m-%d", time.localtime(day_start + 60.0)),
+            "cost_usd": round(_finite(costs[index]), 6),
+            "sessions": len(sessions[index]),
+        })
+
+    result = {
+        "days": days,
+        "source": source,
+        "total": round(_finite(sum(costs)), 6),
+    }
+    _week_cache["key"] = key
+    _week_cache["value"] = dict(result)
+    return dict(result)
 
 
 def _read_session_table() -> Optional[Dict[str, Dict[str, Any]]]:
@@ -1508,8 +1643,11 @@ _others_refreshing = False
 # across restarts, and the payload carries it to the widget.
 ROWS_NAME = "savvy-progress.rows.json"
 ROW_KEYS: Tuple[str, ...] = (
-    "model", "api", "tokens", "cache", "ctx", "cost", "burn", "saved", "today", "daytok",
-    "codex", "pi", "dsh", "others", "agents",
+    "logo", "model", "last", "api", "tokens", "cache", "cost", "saved", "today", "daytok",
+    "codex", "pi", "dsh", "others", "sep",
+    # Extras, all behind the one `extras` switch. Individually hideable so a row that
+    # earns its place can stay while the rest go back off.
+    "warn", "miss", "errors", "week", "tip",
 )
 # Spoken aliases: the slash command accepts the label the user reads on the card.
 ROW_ALIASES: Dict[str, str] = {
@@ -1520,7 +1658,15 @@ ROW_ALIASES: Dict[str, str] = {
     "tokens/day": "daytok",
     "tok/day": "daytok",
     "day": "today",
-    "context": "ctx",
+    "banner": "logo",
+    "art": "logo",
+    "quote": "logo",
+    "divs": "sep",
+    "div": "sep",
+    "divider": "sep",
+    "separator": "sep",
+    "rule": "sep",
+    "sep": "sep",
     "delegates": "agents",
     "delegate": "agents",
     "other": "others",
@@ -1529,7 +1675,7 @@ ROW_ALIASES: Dict[str, str] = {
     "cache_saved": "saved",
     "calls": "api",
     "api calls": "api",
-    "burn/hour": "burn",
+    "turns": "last",
 }
 _rows_cache: Dict[str, Any] = {"key": None, "hidden": ()}
 
@@ -1636,6 +1782,601 @@ def _rows_summary() -> str:
         parts.append(f"hidden: {', '.join(k for k in ROW_KEYS if k in hidden)}")
     parts.append("toggle: /svprogress hide <row>…  |  show <row>…  |  reset")
     return "\n  ".join(parts)
+
+
+# --- extras: failures and the warn row --------------------------------------------
+# Nothing in state.db records a failed call. `sessions` and `session_model_usage` carry
+# no failure, retry or error column, `cost_status` is only ever "unknown", and
+# `sessions.end_reason` only holds lifecycle words (tui_close, cron_complete, ...).
+# `post_api_request` fires from turn_response_intake, i.e. only after a response came
+# back, so it never sees a call that failed. The one failure signal the runtime does
+# publish is `retry_count` on `pre_api_request`: it is the attempt index of the retry
+# loop, so a value above zero means the provider already refused an attempt.
+#
+# So: a plugin-side counter, incremented only by a payload that actually carries one of
+# those fields, persisted in state, and printed as n/a while no such payload has been
+# seen. A confident zero here would be a lie.
+ERROR_FINISH_REASONS = frozenset({"error", "failed", "failure", "cancelled", "canceled"})
+
+
+def _errors_path() -> Path:
+    return _hermes_home() / "state" / ERRORS_NAME
+
+
+def _observe_failure(kwargs: Dict[str, Any]) -> Tuple[Optional[int], bool]:
+    """``(failures this payload proves, did it carry a failure signal at all)``.
+
+    ``None`` for the first member means "this payload says nothing about failure", which
+    is different from "this payload proves zero failures". The second member is what
+    turns the row from ``n/a`` into a number, and it is only ever True for a runtime
+    that actually sends one of the two recognised fields.
+    """
+    if "retry_count" in kwargs:
+        try:
+            value = int(kwargs.get("retry_count") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return (1 if value > 0 else 0), True
+
+    if "finish_reason" in kwargs:
+        reason = str(kwargs.get("finish_reason") or "").strip().lower()
+        return (1 if reason in ERROR_FINISH_REASONS else 0), True
+
+    return None, False
+
+
+def _errors_state() -> Dict[str, Any]:
+    """``{"count": int, "signal": bool, "usd": None, "source": "none"}``.
+
+    ``usd`` is always None: a failed attempt's tokens are not recorded anywhere, so the
+    money a failure wasted is not measurable and the row says n/a rather than guessing.
+    """
+    path = _errors_path()
+    try:
+        stat = path.stat()
+        stamp: Any = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        stamp = None
+    if _errors_cache.get("key") == stamp:
+        return {
+            "count": int(_errors_cache.get("count") or 0),
+            "signal": bool(_errors_cache.get("signal")),
+            "usd": None,
+            "source": "none",
+        }
+
+    count = 0
+    signal = False
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        raw = None
+    if isinstance(raw, dict):
+        count = max(0, _int_value(raw.get("count")))
+        signal = bool(raw.get("signal"))
+
+    _errors_cache["key"] = stamp
+    _errors_cache["count"] = count
+    _errors_cache["signal"] = signal
+    return {"count": count, "signal": signal, "usd": None, "source": "none"}
+
+
+def _record_failure_signal(**kwargs: Any) -> None:
+    """Add one failure to the plugin counter when a hook payload proves one.
+
+    Never raises and never blocks a turn: a failed write is logged and dropped. Called
+    from both API hooks, so it works whether the runtime publishes the retry index or
+    only an error finish reason.
+    """
+    try:
+        proved, signal = _observe_failure(kwargs)
+        if not signal:
+            return
+
+        with _errors_lock:
+            state = _errors_state()
+            count = int(state["count"]) + int(proved or 0)
+            seen = bool(state["signal"]) or signal
+            if not _write_json_atomic(_errors_path(), {"count": count, "signal": seen,
+                                                       "ts": round(time.time(), 3)}):
+                logger.debug("savvy-progress: error counter not saved, keeping it in memory")
+            _errors_cache["key"] = None
+            _errors_cache["count"] = count
+            _errors_cache["signal"] = seen
+    except Exception as exc:  # pragma: no cover - fail-open by contract
+        logger.debug("savvy-progress: failure signal dropped: %s", exc)
+
+
+def _warn_reason(payload: Dict[str, Any], now: Optional[float] = None) -> Optional[Tuple[str, str]]:
+    """``(reason, tone)`` for the one most severe problem, or None when all is well.
+
+    Priority order, most severe first, and only ever one reason: a low cache hit, then
+    a day spend over the soft budget when one is set, then an unpriced model in the day
+    rows, then a snapshot that has gone cold. A healthy card returns None and the row
+    is not built at all, so it never draws an empty placeholder.
+    """
+    now = time.time() if now is None else now
+
+    try:
+        hit = float(payload.get("day_cache_hit_pct") or 0.0)
+    except (TypeError, ValueError):
+        hit = 0.0
+    # A day with no traffic is not a cold cache, it is a quiet day: only complain once
+    # there were billed input tokens to miss.
+    try:
+        billed = float(payload.get("day_input_tokens") or 0.0)
+    except (TypeError, ValueError):
+        billed = 0.0
+    if billed <= 0.0:
+        try:
+            billed = float(payload.get("day_tokens") or 0.0)
+        except (TypeError, ValueError):
+            billed = 0.0
+    if billed > 0.0 and hit < WARN_CACHE_HIT_MIN:
+        return f"cache {hit:.1f}% under {WARN_CACHE_HIT_MIN:.0f}%", "warn"
+
+    budget = _budget_usd()
+    try:
+        spend = float(payload.get("day_cost_usd") or 0.0)
+    except (TypeError, ValueError):
+        spend = 0.0
+    if budget is not None and spend > budget:
+        return f"day ${spend:.2f} over ${budget:.2f}", "error"
+
+    if payload.get("day_unpriced"):
+        return "unpriced model today", "warn"
+
+    try:
+        ts = float(payload.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    if ts > 0.0 and (now - ts) > WARN_STALE_S:
+        return f"snapshot {_age_text(now - ts)} old", "warn"
+
+    return None
+
+
+def _spark_text(values: Any, width: int = WEEK_DAYS) -> str:
+    """One sparkline of `width` cells from any list of numbers. Never wider, never throws.
+
+    Plain ASCII ramp so the plain-text card and the widget print the same shape; a day
+    with no spend is the lowest cell, not a gap, so the row keeps its width.
+    """
+    series = [float(value or 0.0) for value in (values or []) if isinstance(value, (int, float))]
+    series = series[:width] + [0.0] * max(0, width - len(series))
+    top = max(series) if series else 0.0
+    if top <= 0.0:
+        return SPARK_RAMP[0] * width
+    ramp = SPARK_RAMP
+    out = []
+    for value in series:
+        step = int((max(0.0, value) / top) * (len(ramp) - 1))
+        out.append(ramp[min(step, len(ramp) - 1)])
+    return "".join(out)
+
+
+# --- theme + separator ----------------------------------------------------------------
+# The card ships two palettes, ``savvy`` (neon night, the default) and ``grove`` (green
+# garden), and four separator styles. Both choices live in
+# ``state/savvy-progress.theme.json`` as ``{"theme": ..., "sep": ...}`` — the same shape the
+# row toggle uses — so one edit or one ``/svprogress theme|sep`` survives a restart, and the
+# payload carries them to the widget.
+THEME_NAME = "savvy-progress.theme.json"
+# Extras, the soft day budget and the tip period live in the same file, so one write
+# persists them and one read restores them.
+EXTRAS_DEFAULT_KEY = "extras"
+TIP_S_KEY = "tip_s"
+THEMES: Tuple[str, ...] = ("savvy", "grove", "wine")
+# wine jungle is the shipped default: the grove vine in wine ink.
+DEFAULT_THEME = "wine"
+SEP_STYLES: Tuple[str, ...] = ("gem", "rule", "dots", "shade")
+DEFAULT_SEP = "gem"
+# Spoken aliases: what a user calls the palette, not what the file stores.
+THEME_ALIASES: Dict[str, str] = {
+    "neon": "savvy",
+    "night": "savvy",
+    "purple": "savvy",
+    "mock": "savvy",
+    "default": "savvy",
+    "skyline": "savvy",
+    "cyan": "savvy",
+    "green": "grove",
+    "garden": "grove",
+    "grass": "grove",
+    "tree": "grove",
+    "trees": "grove",
+    "forest": "grove",
+    "vine": "grove",
+    "lime": "grove",
+}
+SEP_ALIASES: Dict[str, str] = {
+    "gem": "gem",
+    "diamond": "gem",
+    "◇": "gem",
+    "gemstone": "gem",
+    "rule": "rule",
+    "line": "rule",
+    "plain": "rule",
+    "bar": "rule",
+    "dots": "dots",
+    "dot": "dots",
+    "dotted": "dots",
+    "shade": "shade",
+    "blocks": "shade",
+    "block": "shade",
+    "shades": "shade",
+}
+# Banner art per palette: two sky rows and one ground row. The shape is identical in both
+# themes, so switching never changes the card's height. Keep every line <= ROW_W cells.
+ART: Dict[str, Dict[str, Any]] = {
+    "savvy": {
+        "top": (
+            "   *    .   (  )   .    *   .",
+            "  .-┬-┬--┬---┬---┬--┬-.",
+        ),
+        "ground": "  ·--┬----┬-----┬----┬----┬--·",
+    },
+    "grove": {
+        "top": (
+            "   \\|/    \\|/     \\|/    \\|/",
+            "  ,^,^,^,^,^,^,^,^,^,^,^,^,^",
+        ),
+        "ground": "  ^^^ ,^, ^^^^ ,^, ^^^ ,^, ^^",
+    },
+}
+# Separator glyphs for the printed card: the same contract the widget draws, centred in the
+# card's own width. ``gem`` is the default; ``shade`` is theme-independent by design.
+SEP_GLYPHS: Dict[str, str] = {"savvy": " ◇ ", "grove": " ,^, ", "wine": " ,^, "}
+# wine jungle shares the grove art object, so one edit reaches both palettes.
+ART["wine"] = ART["grove"]
+SHADE_GLYPH = " ░▒▓██▓▒░ "
+# (stamp, theme, sep): one file, one read, one cache.
+_theme_cache: Dict[str, Any] = {"key": None, "theme": DEFAULT_THEME, "sep": DEFAULT_SEP}
+
+# Rotating footer tips: one array, plain text, no emoji, so they are easy to edit and
+# cannot carry a wide glyph into a fixed-width row. About cache, cost and prompt bloat.
+TIPS: Tuple[str, ...] = (
+    "cache: keep the stable prefix first",
+    "cache: a warm day beats one warm chat",
+    "cache: cache reads bill far below input",
+    "cache: a long system prompt pays itself back",
+    "cache: one big prompt beats many small ones",
+    "cost: output tokens are the expensive ones",
+    "cost: judge the day, not this one chat",
+    "cost: a retry bills the whole prompt again",
+    "cost: an unpriced model reads as zero, not free",
+    "bloat: drop the file you already quoted",
+    "bloat: one tool result beats three",
+    "bloat: trim old turns before the next call",
+)
+# Sentinels: "no argument given" is not the same as "set this to None".
+_KEEP = object()
+
+
+def _theme_path() -> Path:
+    return _hermes_home() / "state" / THEME_NAME
+
+
+def _normalize_theme(name: Any) -> Optional[str]:
+    """One spoken or written palette name to its theme key, or None when unknown."""
+    text = str(name or "").strip().lower()
+    if not text:
+        return None
+    text = THEME_ALIASES.get(text, text)
+    return text if text in THEMES else None
+
+
+def _normalize_sep(name: Any) -> Optional[str]:
+    """One spoken or written separator style to its key, or None when unknown."""
+    text = str(name or "").strip().lower()
+    if not text:
+        return None
+    text = SEP_ALIASES.get(text, text)
+    return text if text in SEP_STYLES else None
+
+
+def _theme_stamp() -> Any:
+    try:
+        stat = _theme_path().stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _normalize_extras(name: Any) -> Optional[bool]:
+    """``on`` / ``off`` (and the usual spoken forms) to a bool, or None when unknown."""
+    text = str(name or "").strip().lower()
+    if text in ("on", "true", "yes", "y", "1", "enable", "enabled", "show", "shown"):
+        return True
+    if text in ("off", "false", "no", "n", "0", "disable", "disabled", "hide", "hidden"):
+        return False
+    return None
+
+
+def _theme_settings() -> Dict[str, Any]:
+    """``{"theme","sep","extras","budget_usd","tip_s"}`` from one file read.
+
+    Missing or unreadable fields take defaults, and a file written before the extras key
+    existed keeps its palette and separator: extras default ON so the new rows are
+    visible while they are being judged, which is the only way to judge them.
+    """
+    stamp = _theme_stamp()
+    # A None key means "re-read": either nothing is cached yet or a write invalidated it.
+    # Comparing None against a missing file's None stamp would otherwise return the previous
+    # HOME's settings after HERMES_HOME moves, which is how a stale budget survives.
+    cached_key = _theme_cache.get("key")
+    if cached_key is not None and cached_key == stamp and isinstance(_theme_cache.get("all"), dict):
+        return dict(_theme_cache["all"])  # type: ignore[arg-type]
+
+    theme = DEFAULT_THEME
+    sep = DEFAULT_SEP
+    extras = EXTRAS_DEFAULT
+    budget: Optional[float] = None
+    tip_s = TIP_S_DEFAULT
+    if stamp is not None:
+        try:
+            raw = json.loads(_theme_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            raw = None
+        if isinstance(raw, dict):
+            theme = _normalize_theme(raw.get("theme")) or DEFAULT_THEME
+            sep = _normalize_sep(raw.get("sep")) or DEFAULT_SEP
+            parsed = _normalize_extras(raw.get(EXTRAS_DEFAULT_KEY))
+            if parsed is not None:
+                extras = parsed
+            try:
+                amount = float(raw.get(WARN_BUDGET_KEY))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                amount = 0.0
+            if amount > 0.0:
+                budget = amount
+            try:
+                period = float(raw.get(TIP_S_KEY))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                period = 0.0
+            if period >= 1.0:
+                tip_s = period
+        elif isinstance(raw, str):
+            # A file written before the separator existed held just the palette name.
+            theme = _normalize_theme(raw) or DEFAULT_THEME
+
+    settings = {
+        "theme": theme,
+        "sep": sep,
+        "extras": extras,
+        "budget_usd": budget,
+        "tip_s": tip_s,
+    }
+    _theme_cache["key"] = stamp
+    _theme_cache["theme"] = theme
+    _theme_cache["sep"] = sep
+    _theme_cache["extras"] = extras
+    _theme_cache["all"] = dict(settings)
+    return dict(settings)
+
+
+def _theme_config() -> Tuple[str, str]:
+    """``(theme, sep)`` from one file read. Missing or unreadable fields take defaults."""
+    settings = _theme_settings()
+    return str(settings["theme"]), str(settings["sep"])
+
+
+def _current_theme() -> str:
+    """The saved palette, or the default when the file is missing or unreadable."""
+    return _theme_config()[0]
+
+
+def _current_sep() -> str:
+    """The saved separator style, or the default when the file is missing or unreadable."""
+    return _theme_config()[1]
+
+
+def _current_extras() -> bool:
+    """Whether the six experimental rows are drawn. Defaults to EXTRAS_DEFAULT."""
+    return bool(_theme_settings()["extras"])
+
+
+def _budget_usd() -> Optional[float]:
+    """The soft day budget in USD, or None when no budget key is set."""
+    value = _theme_settings()["budget_usd"]
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _current_tip_s() -> float:
+    """Seconds one tip stays on screen before the footer rotates."""
+    value = _theme_settings()["tip_s"]
+    return float(value) if isinstance(value, (int, float)) and value >= 1.0 else TIP_S_DEFAULT
+
+
+def _write_theme_config(
+    theme: str,
+    sep: str,
+    extras: Optional[bool] = None,
+    budget_usd: Any = _KEEP,
+    tip_s: Any = _KEEP,
+) -> bool:
+    """Persist every setting in the one file. Returns False when it could not be written.
+
+    Fields left at their sentinel keep their current value, so `/svprogress theme grove`
+    cannot silently reset the extras switch and `/svprogress extras off` cannot move the
+    palette. `budget_usd=None` clears the budget; every other value overrides it.
+    """
+    current = _theme_settings()
+    data: Dict[str, Any] = {
+        "theme": theme,
+        "sep": sep,
+        "extras": "on" if (current["extras"] if extras is None else extras) else "off",
+        "tip_s": current["tip_s"] if tip_s is _KEEP else tip_s,
+    }
+    budget = current["budget_usd"] if budget_usd is _KEEP else budget_usd
+    if budget is not None:
+        data[WARN_BUDGET_KEY] = budget
+    ok = _write_json_atomic(_theme_path(), data)
+    _theme_cache["key"] = None  # force a re-read against the new stamp
+    return ok
+
+
+def _extras_summary() -> str:
+    settings = _theme_settings()
+    budget = settings["budget_usd"]
+    state = "on" if settings["extras"] else "off"
+    money = "${:.2f}".format(budget) if budget else "unset"
+    return "\n  ".join([
+        "savvy-progress extras  {}   tip {:.0f}s   budget {}".format(
+            state, float(settings["tip_s"]), money),
+        "rows: warn, miss, errors, week, tip (plus the gradient cache gauge)",
+        "set: /svprogress extras on | off | next",
+    ])
+
+
+def _set_extras(name: str) -> str:
+    """``/svprogress extras on|off``. Always returns one message, never a traceback."""
+    chosen = _normalize_extras(name)
+    if chosen is None:
+        return "savvy-progress: extras take on | off"
+
+    theme, sep = _theme_config()
+    path = _theme_path()
+    with _write_lock(path.parent / (path.name + ".update")) as taken:
+        if not taken:
+            return "savvy-progress: theme file is busy, try again"
+        written = _write_theme_config(theme, sep, extras=chosen)
+
+    if not written:
+        return "savvy-progress: extras not saved (state directory read-only?)"
+
+    _publish_extras(chosen)
+    return "savvy-progress: extras {}".format("on" if chosen else "off")
+
+
+def _publish_extras(on: bool) -> bool:
+    """Push the switch into the live snapshot so the card redraws on the next poll."""
+    global _last_payload
+
+    value = "on" if on else "off"
+    if _republish(extras=value):
+        return True
+
+    payload = _read_prev(_snapshot_path())
+    if not isinstance(payload, dict) or not payload:
+        return False
+    merged = dict(payload)
+    merged["extras"] = value
+    written = _write_json_atomic(_snapshot_path(), merged)
+    if written:
+        _last_payload = merged
+    return written
+
+
+def _publish_theme(theme: str, sep: str) -> bool:
+    # extras / budget / tip_s ride in the same file; _write_theme_config keeps them.
+    """Push the palette and separator into the live snapshot, so the card redraws on the
+    next poll.
+
+    ``_republish`` needs an in-memory payload; a process that only ran
+    ``/svprogress theme next`` has not built one yet, so the old payload is patched on
+    disk instead. ``_republish`` owns ``_publish_lock``, so this never takes it again.
+    """
+    global _last_payload
+
+    if _republish(theme=theme, sep=sep):
+        return True
+
+    payload = _read_prev(_snapshot_path())
+    if not isinstance(payload, dict) or not payload:
+        return False
+    merged = dict(payload)
+    merged["theme"] = theme
+    merged["sep"] = sep
+    written = _write_json_atomic(_snapshot_path(), merged)
+    if written:
+        _last_payload = merged
+    return written
+
+
+def _next_theme() -> str:
+    """The palette after the current one, wrapping. ``savvy -> grove -> savvy``."""
+    current = _current_theme()
+    index = THEMES.index(current) if current in THEMES else 0
+    return THEMES[(index + 1) % len(THEMES)]
+
+
+def _next_sep() -> str:
+    """The separator after the current one, wrapping. ``gem -> rule -> dots -> shade``."""
+    current = _current_sep()
+    index = SEP_STYLES.index(current) if current in SEP_STYLES else 0
+    return SEP_STYLES[(index + 1) % len(SEP_STYLES)]
+
+
+def _sep_line(theme: Any, sep: Any, width: int = CARD_W) -> str:
+    """One separator of ``width`` cells: the theme glyph centred between two rule runs.
+
+    Built from the same numbers the widget uses (glyph cells, remainder split with the
+    left run taking the odd cell) so both surfaces print the same shape.
+    """
+    style = _normalize_sep(sep) or DEFAULT_SEP
+    if style == "rule":
+        return RULE * width
+    if style == "dots":
+        return ("· " * (width // 2 + 1))[:width]
+    glyph = SHADE_GLYPH if style == "shade" else SEP_GLYPHS.get(_normalize_theme(theme) or DEFAULT_THEME, "")
+    if len(glyph) >= width:
+        return RULE * width
+    rest = width - len(glyph)
+    left = -(-rest // 2)  # ceil, so the left run takes the odd cell
+    return RULE * left + glyph + RULE * (rest - left)
+
+
+def _theme_summary() -> str:
+    theme, sep = _theme_config()
+    themes = ", ".join(name + (" *" if name == theme else "") for name in THEMES)
+    seps = ", ".join(name + (" *" if name == sep else "") for name in SEP_STYLES)
+    return "\n  ".join([
+        f"savvy-progress theme  {theme}   sep  {sep}",
+        f"themes: {themes}  (* = active)",
+        f"seps: {seps}  (* = active)",
+        "set: /svprogress theme savvy | grove | next   |   sep gem | rule | dots | shade | next",
+    ])
+
+
+def _set_theme(name: str) -> str:
+    """``/svprogress theme <name>``. Always returns one message, never a traceback."""
+    chosen = _normalize_theme(name)
+    if chosen is None:
+        return f"savvy-progress: unknown theme '{name}'. Themes: " + ", ".join(THEMES)
+
+    sep = _current_sep()
+    path = _theme_path()
+    with _write_lock(path.parent / (path.name + ".update")) as taken:
+        if not taken:
+            return "savvy-progress: theme file is busy, try again"
+        written = _write_theme_config(chosen, sep)
+
+    if not written:
+        return "savvy-progress: theme not saved (state directory read-only?)"
+
+    _publish_theme(chosen, sep)
+    return f"savvy-progress: theme {chosen}"
+
+
+def _set_sep(name: str) -> str:
+    """``/svprogress sep <style>``. Always returns one message, never a traceback."""
+    chosen = _normalize_sep(name)
+    if chosen is None:
+        return f"savvy-progress: unknown sep '{name}'. Styles: " + ", ".join(SEP_STYLES)
+
+    theme = _current_theme()
+    path = _theme_path()
+    with _write_lock(path.parent / (path.name + ".update")) as taken:
+        if not taken:
+            return "savvy-progress: theme file is busy, try again"
+        written = _write_theme_config(theme, chosen)
+
+    if not written:
+        return "savvy-progress: sep not saved (state directory read-only?)"
+
+    _publish_theme(theme, chosen)
+    return f"savvy-progress: sep {chosen}"
 
 
 def _blank_agent(name: str) -> Dict[str, Any]:
@@ -2460,6 +3201,10 @@ def _build_snapshot(
     cache_saved_source = str(primary.get("cache_saved_source") or "none")
     # Cross-agent spend is cached for a minute; the call is cheap on every other hook.
     others = _others_totals(now)
+    # Extras: both queries are cached for a few seconds, so a hook pays for them once.
+    miss = _day_miss_usd(now)
+    week = _week_spend(now)
+    errors = _errors_state()
 
     payload = {
         "ts": round(now, 3),
@@ -2481,8 +3226,9 @@ def _build_snapshot(
         "primary_session": primary_id,
         "delegates": delegates,
         "total_cost_usd": _finite(total_cost),
-        "context_tokens": _read_context_tokens(primary_id),
-        "context_window": _context_window(),
+        # Today's blended cache hit rate: what the `cache` row draws instead of the
+        # session-only rate, so the card answers "how warm is my cache today".
+        "day_cache_hit_pct": float(day["cache_hit_pct"]),
         # Burn is the total cost over the session's own wall clock. It follows cost_source:
         # a provider number burns a real rate, a table number burns an estimate.
         "burn_usd_per_hour": _finite(burn_usd_per_hour),
@@ -2513,6 +3259,33 @@ def _build_snapshot(
         "others_ts": others["ts"],
         # Rows the user switched off. The widget drops them; the card skips their lines.
         "hidden_rows": _hidden_rows(),
+        # Palette the widget draws in. The plugin owns the choice; the widget falls back
+        # to `savvy` / `gem` for a payload written before these keys existed.
+        "theme": _current_theme(),
+        "sep": _current_sep(),
+        # --- extras -------------------------------------------------------------
+        # One master switch for the six experimental rows. The widget builds none of
+        # them when this is "off", so the card keeps its old 18-row shape.
+        "extras": "on" if _current_extras() else "off",
+        # Cache miss cost: what a perfect cache would have saved today. Same price
+        # resolution as `saved`, cache writes excluded on purpose. See _day_miss_usd.
+        "miss_usd": miss["usd"],
+        "miss_source": miss["source"],
+        # True when at least one of today's usage rows has no price row. Reported, never
+        # estimated: an unpriced model adds nothing to the money.
+        "day_unpriced": bool(miss["unpriced"]),
+        # Seven local calendar days, oldest first, for the `week` sparkline.
+        "week": week["days"],
+        "week_source": week["source"],
+        "week_total_usd": week["total"],
+        # Failed calls. state.db records none, so this is the plugin's own counter and
+        # `signal` stays False until a hook payload proves a failure is observable.
+        "errors": errors,
+        # Soft day budget in USD, or None. The `warn` row uses it when it is set.
+        "budget_usd": _budget_usd(),
+        # Seconds one tip stays up. The tip text itself is picked by each surface from
+        # the shared TIPS list, so the payload does not rewrite on every rotation.
+        "tip_s": _current_tip_s(),
     }
     if not self_view:
         # A delegate builds its own view before the shared card. Booking that as canonical
@@ -2620,6 +3393,20 @@ def _snapshot_locked(session_id: str, now: float) -> Optional[Dict[str, Any]]:
     return payload
 
 
+def _on_pre_api_request(**kwargs: Any) -> None:
+    """``pre_api_request`` observer: the only failure signal the runtime publishes.
+
+    The payload carries ``retry_count``, the attempt index of the turn's retry loop
+    (agent/turn_api_request.py). A value above zero means the provider already refused
+    an attempt, which is the one honest "this call failed" fact available. Observer
+    only: nothing here can delay or alter the request, and it never raises.
+    """
+    try:
+        _record_failure_signal(**kwargs)
+    except Exception as exc:  # pragma: no cover — fail-open by contract
+        logger.debug("savvy-progress: failure signal failed: %s", exc)
+
+
 def _on_post_tool_call(**kwargs: Any) -> None:
     """``post_tool_call`` observer. Never raises."""
     try:
@@ -2653,6 +3440,8 @@ def _on_post_api_request(**kwargs: Any) -> None:
             return
 
         _pin_session(session_id)
+        # An error finish reason is the other failure signal the runtime publishes.
+        _record_failure_signal(**kwargs)
 
         baseline = (_read_sessions(_sessions_path()).get(session_id) or {}).get("totals") or {}
         if baseline:
@@ -2720,6 +3509,36 @@ def _age_text(seconds: float) -> str:
     return f"{int(seconds // 3600)}h"
 
 
+# The banner mark above the header: a rising bar ramp beside the wordmark. Block art only,
+# never emoji, because the terminals this card lands in are not all equally wide.
+LOGO_MARK = "▁▂▃▅▇█  S A V V Y"
+
+
+def _logo_line() -> str:
+    """The old banner line, kept for callers of that name. The card draws ART now."""
+    return f"  {LOGO_MARK}"
+
+
+def _art_line(text: str) -> str:
+    """One banner art line, centred in CARD_W. Never truncated: the ART table lines are
+    all shorter than CARD_W, and an art line that is not is a bug worth seeing."""
+    body = "".join(ch for ch in str(text) if ch >= " ")
+    pad = max(0, (CARD_W - len(body)) // 2)
+    return (" " * pad) + body
+
+
+def _art_lines(theme: Any) -> Tuple[str, str]:
+    """The two sky art rows for the active palette, centred. Falls back to the default."""
+    art = ART[_normalize_theme(theme) or DEFAULT_THEME]
+    return _art_line(art["top"][0]), _art_line(art["top"][1])
+
+
+def _ground_line(theme: Any) -> str:
+    """The ground art row for the active palette, centred. Same shape in every theme."""
+    art = ART[_normalize_theme(theme) or DEFAULT_THEME]
+    return _art_line(art["ground"])
+
+
 def _header(model: Any, provider: Any) -> str:
     """One line: PROGRESS, the model tail, the provider. Always under CARD_W."""
     clean = "".join(ch for ch in str(model or "unknown") if ch >= " " and ch != "\x7f")
@@ -2730,6 +3549,22 @@ def _header(model: Any, provider: Any) -> str:
         tail = tail[: max(3, room - 1)] + "…"
     line = "PROGRESS  " + tail + (f"  {prov}" if prov else "")
     return line[:CARD_W]
+
+
+def _tip_text(period: Any = None) -> str:
+    """The tip currently on screen, picked from TIPS by the wall clock.
+
+    Both surfaces run the same rule (floor(now / period) mod len(TIPS)), so the printed
+    card and the widget show the same line without either one storing an index.
+    """
+    try:
+        step = float(period or TIP_S_DEFAULT)
+    except (TypeError, ValueError):
+        step = TIP_S_DEFAULT
+    if step < 1.0:
+        step = TIP_S_DEFAULT
+    index = int(time.time() // step) % len(TIPS)
+    return TIPS[index]
 
 
 def _row(label: str, value: str, suffix: str = "") -> str:
@@ -2903,6 +3738,9 @@ def render_card(payload: Dict[str, Any]) -> str:
     if source not in ("provider", "table", "none"):
         source = "none"
 
+    theme = _normalize_theme(payload.get("theme")) or DEFAULT_THEME
+    sep = _normalize_sep(payload.get("sep")) or DEFAULT_SEP
+
     delegates = payload.get("delegates")
     delegates = delegates if isinstance(delegates, dict) else {}
     delegate_count = max(0, _int_value(delegates.get("count")))
@@ -2916,8 +3754,11 @@ def render_card(payload: Dict[str, Any]) -> str:
 
     tokens_in = payload.get("input_tokens") or 0
     cache_read = payload.get("cache_read") or 0
+    # The cache number is TODAY's blended hit rate, the same figure the widget draws.
+    # A snapshot written before that key existed still carries the session-only rate.
+    day_hit = payload.get("day_cache_hit_pct")
     try:
-        hit = float(payload.get("cache_hit_pct") or 0.0)
+        hit = float(day_hit) if day_hit is not None else float(payload.get("cache_hit_pct") or 0.0)
     except (TypeError, ValueError):
         hit = 0.0
     if not hit:
@@ -2925,7 +3766,7 @@ def render_card(payload: Dict[str, Any]) -> str:
 
     cost_value, cost_suffix = _cost_text(total, source)
     suffix = f"   {cost_suffix}" if cost_suffix else ""
-    rule = RULE * (CARD_W - 2)
+    rule = _sep_line(theme, sep)
 
     saved_source = str(payload.get("cache_saved_source") or "none")
     if saved_source not in ("provider", "table", "agent", "estimate", "none"):
@@ -2946,12 +3787,6 @@ def render_card(payload: Dict[str, Any]) -> str:
         f"  {delegate_count} agent{'s' if delegate_count != 1 else ''}"
     )
 
-    if delegate_count:
-        agents_row = _row("agents", _thousands(delegate_count),
-                          f"   {_plus_text(delegates.get('cost_usd'), delegate_source)}")
-    else:
-        agents_row = _row("agents", "none")
-
     hidden = set()
     for name in (payload.get("hidden_rows") or []):
         key = _normalize_row(name)
@@ -2959,17 +3794,6 @@ def render_card(payload: Dict[str, Any]) -> str:
             hidden.add(key)
 
     others_block = _others_lines(payload, hidden)
-
-    ctx_tokens = max(0, _int_value(payload.get("context_tokens")))
-    ctx_window = _int_value(payload.get("context_window"))
-    if ctx_window <= 0:
-        ctx_window = DEFAULT_CONTEXT_WINDOW
-    ctx_pct = min(100.0, ctx_tokens / ctx_window * 100.0)
-    context_row = _row(
-        "context",
-        f"{_compact_tokens(ctx_tokens)}/{_compact_tokens(ctx_window)}",
-        f"   {ctx_pct:4.1f}%",
-    )
 
     def shown(*keys: str) -> bool:
         """True when at least one of ``keys`` is still on. Hidden rows draw nothing."""
@@ -2979,32 +3803,71 @@ def render_card(payload: Dict[str, Any]) -> str:
     if shown("api"):
         body.append(_row("api calls", _thousands(payload.get("api_calls"))))
     if shown("tokens"):
-        # The cache gauge lives inside the input row, so `cache` controls only that marker.
-        marker = f"   ◐ {f'{hit:.1f}%'.rjust(5)}" if shown("cache") else ""
         body.extend([
-            _row("input", _thousands(tokens_in), marker),
+            _row("input", _thousands(tokens_in)),
             _row("output", _thousands(payload.get("output_tokens"))),
             _row("cache read", _thousands(cache_read)),
         ])
-    if shown("ctx"):
-        body.append(context_row)
+    if shown("cache"):
+        # Same number the widget draws: today's blended hit rate, said out loud.
+        body.append(_row("cache hit", f"{hit:.1f}%", "   today"))
     if shown("cost"):
         body.append(_row("cost", cost_value, suffix))
-    if shown("burn"):
-        body.append(_row("burn/hour", _rate_text(payload.get("burn_usd_per_hour"), source)))
     if shown("saved"):
         body.append(_row("cache saved", saved_value, f"   {saved_suffix}" if saved_suffix else ""))
     if shown("today"):
         body.append(_row("today", day_value, day_tail))
     if shown("daytok"):
-        body.append(_row("tokens/day", _thousands(payload.get("day_tokens"))))
-    if shown("agents"):
-        body.append(agents_row)
+        # Delegate tokens ride on the day row, the same way the widget draws them.
+        agent_tokens = max(0, _int_value(delegates.get("input_tokens"))) \
+            + max(0, _int_value(delegates.get("output_tokens"))) \
+            + max(0, _int_value(delegates.get("cache_read")))
+        agent_tail = f"   {_compact_tokens(agent_tokens)} ag" if agent_tokens > 0 else ""
+        body.append(_row("tokens/day", _thousands(payload.get("day_tokens")), agent_tail))
     if others_block:
         body.extend(others_block)
 
+    # --- extras ------------------------------------------------------------------
+    # All six, in card order, and none of them when the switch is off. The `warn` row
+    # is the only conditional one: no reason means no row, never a blank line.
+    if _current_extras():
+        warn = _warn_reason(payload)
+        if warn and shown("warn"):
+            reason, _tone = warn
+            # The reason is prose, so it spans the label column and the value field
+            # instead of the 12-cell numeric field, which used to clip it to ten chars.
+            body.append(f"  {'warn'.ljust(LABEL_W)}! {reason}")
+        if shown("miss"):
+            miss_source = str(payload.get("miss_source") or "none")
+            if miss_source not in ("provider", "table", "estimate", "none"):
+                miss_source = "none"
+            miss_value, miss_suffix = _cost_text(payload.get("miss_usd"), miss_source)
+            body.append(_row("miss", miss_value, f"   {miss_suffix}" if miss_suffix else ""))
+        if shown("errors"):
+            errs = payload.get("errors")
+            errs = errs if isinstance(errs, dict) else {}
+            if errs.get("signal"):
+                body.append(_row("errors", f"{_int_value(errs.get('count'))} failed", "   $n/a"))
+            else:
+                body.append(_row("errors", "$n/a", "   no signal"))
+        if shown("week"):
+            days = payload.get("week")
+            days = [d for d in days if isinstance(d, dict)] if isinstance(days, list) else []
+            spark = _spark_text([d.get("cost_usd") for d in days])
+            week_source = str(payload.get("week_source") or "none")
+            if week_source not in ("provider", "table", "estimate", "none"):
+                week_source = "none"
+            week_value, _week_suffix = _cost_text(payload.get("week_total_usd"), week_source)
+            body.append(_row("week", spark, f"   {week_value}"))
+        if shown("tip"):
+            body.append(_row("tip", _tip_text(payload.get("tip_s"))[: NUM_W].rjust(NUM_W)))
+
     header_model = payload.get("model") if shown("model") else ""
-    lines = [_header(header_model, payload.get("provider")), rule]
+    theme = _normalize_theme(payload.get("theme")) or DEFAULT_THEME
+    # Same three art rows the widget draws, for the same palette: two sky rows on top,
+    # the ground row under the last value row.
+    banner = list(_art_lines(theme)) if shown("logo") else []
+    lines = banner + [_header(header_model, payload.get("provider")), rule]
     lines.extend(body)
     lines.append(rule)
 
@@ -3027,6 +3890,9 @@ def render_card(payload: Dict[str, Any]) -> str:
     if age > STALE_S:
         lines.append(f"  last update {_age_text(age)} ago")
 
+    if shown("logo"):
+        lines.append(_ground_line(theme))
+
     return "\n".join(line[:CARD_W].rstrip() for line in lines)
 
 
@@ -3038,6 +3904,15 @@ def _cmd_progress(raw_args: str = "", *args: Any, **kwargs: Any) -> str:
       ``/svprogress show burn``         draw them again
       ``/svprogress reset``             draw every row
       ``/svprogress rows``              print which rows are shown or hidden
+      ``/svprogress theme``             print the active palette and the choices
+      ``/svprogress theme grove``       draw in the green garden palette
+      ``/svprogress theme savvy``       draw in the neon night palette, the default
+      ``/svprogress theme next``        cycle to the other palette
+      ``/svprogress sep``               print the active separator style and the choices
+      ``/svprogress sep gem|rule|dots|shade``  switch the separator on both surfaces
+      ``/svprogress sep next``          cycle to the next separator
+      ``/svprogress extras``            show the experimental rows switch
+      ``/svprogress extras on|off``     draw or drop warn/miss/errors/week/tip
     """
     try:
         words = str(raw_args or "").replace(",", " ").split()
@@ -3061,6 +3936,27 @@ def _cmd_progress(raw_args: str = "", *args: Any, **kwargs: Any) -> str:
             return "savvy-progress: every row shown"
         if verb in ("rows", "list"):
             return _rows_summary()
+        if verb in ("theme", "themes", "palette", "colours", "colors", "colour", "color"):
+            target = names[0].lower() if names else ""
+            if not target or target in ("list", "ls", "show", "?", "help"):
+                return _theme_summary()
+            if target in ("next", "cycle", "rotate", "switch", "toggle"):
+                target = _next_theme()
+            return _set_theme(target)
+        if verb in ("sep", "seps", "separator", "separators", "divider", "dividers", "rule"):
+            target = names[0].lower() if names else ""
+            if not target or target in ("list", "ls", "show", "?", "help"):
+                return _theme_summary()
+            if target in ("next", "cycle", "rotate", "switch", "toggle"):
+                target = _next_sep()
+            return _set_sep(target)
+        if verb in ("extras", "extra", "experimental", "exp"):
+            target = names[0].lower() if names else ""
+            if not target or target in ("list", "ls", "show", "?", "help", "status"):
+                return _extras_summary()
+            if target in ("next", "cycle", "rotate", "switch", "toggle"):
+                target = "off" if _current_extras() else "on"
+            return _set_extras(target)
         if verb in ("hide", "off", "mute", "show", "on", "unmute"):
             return _rows_summary()
     except Exception as exc:
@@ -3078,6 +3974,8 @@ def _cmd_progress(raw_args: str = "", *args: Any, **kwargs: Any) -> str:
             return NO_DATA
         payload = dict(payload)
         payload["hidden_rows"] = _hidden_rows()
+        payload["theme"] = _current_theme()
+        payload["sep"] = _current_sep()
         return render_card(payload)
     except Exception as exc:
         logger.debug("savvy-progress: /svprogress failed: %s", exc)
@@ -3091,6 +3989,13 @@ def _latest_session_id() -> Optional[str]:
 
 def register(ctx: Any) -> None:
     ctx.register_hook("post_tool_call", _on_post_tool_call)
+    # Failure counting needs the request-side hook: post_api_request only fires after a
+    # response came back, so it never sees the call that failed. Optional by design, and
+    # the errors row prints n/a when this hook is not available.
+    try:
+        ctx.register_hook("pre_api_request", _on_pre_api_request)
+    except Exception as exc:
+        logger.debug("savvy-progress: pre_api_request hook not registered: %s", exc)
     # Second trigger, same writer: an API response refreshes the card even when no tool ran.
     try:
         ctx.register_hook("post_api_request", _on_post_api_request)

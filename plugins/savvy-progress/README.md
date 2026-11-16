@@ -1,5 +1,7 @@
 # savvy-progress
 
+> **"prompt once, read forever."**
+
 Live token, cache and cost card for the Hermes TUI, as an ambient widget plus a `/svprogress`
 command.
 
@@ -8,102 +10,112 @@ The widget (`$HERMES_HOME/tui-widgets/savvy-progress.mjs`) polls that file twice
 draws a fixed-size card in the top-right corner, so nothing on screen ever reflows.
 
 ```
-PROGRESS
-model   deepseek-v4.1-flash
-tokens          198.3k / 50.4k
-cache       ████████████ 97.1%
-ctx         █░░░░░░░░░░░  8.7%
+PROGRESS  deepseek-v4.1-flash
+────────────── ◇ ─────────────
+last          1.8k/2.2k ~$0.0036
+cache       ████████░░░░ 96.5% avg
 cost                  ~$0.1606
-burn                  ~$0.24/h
 saved                 ~$1.9864
+────────────── ◇ ─────────────
 today       ~$2.2493  22 chats
-tok/day              48.7M
-codex        $n/a   21.6M?
-pi        ~$1.6343 111.3M
-dsh       ~$3.0715  93.8M
-others    ~$4.7058 226.8M
-agents                    none
+tok/day        18.4M · 1.2M ag
+────────────── ◇ ─────────────
+codex   5 models      41.6M~$17.9381?
+pi     15 models     111.3M ~$1.6343?
+dsh     3 models      93.8M ~$3.0715?
+others              246.7M~$22.6438?
+ ·--┬----┬-----┬----┬----┬--·
+──────────────────────────────
 ```
+
+The printed card draws the same two sky art rows above `PROGRESS` (the block above shows
+the body only) and the same ground row, so `/svprogress` and the widget agree in every
+palette.
 
 ## Day boundary
 
-`today` and `tok/day` are a local calendar day: 00:00 to the next 00:00, not a rolling 24 h
-window. A rolling window counted yesterday evening's chats as today's, which reads as a
-miscount. DST is handled by asking `mktime` for the next midnight.
+`today` is a local calendar day: 00:00 to the next 00:00, not a rolling 24 h window. A
+rolling window counted yesterday evening's chats as today's, which reads as a miscount. DST
+is handled by asking `mktime` for the next midnight.
 
-## Rows
+## Rows (widget)
 
 | Row | Meaning |
 | --- | --- |
-| `model` | Busiest model row of the tracked session |
-| `tokens` | Billed input / output tokens for that session |
-| `cache` | `cache_read / (input + cache_read)`, green at 70% and above |
-| `ctx` | Biggest prompt sent vs the configured context window |
+| `logo` | Banner art: two sky rows above the values and the ground row below, three rows in every palette. `/svprogress hide logo` drops all three |
+| `model` | The header line: `PROGRESS` in the 8-cell label column, the model tail right-aligned in the value column (plus the snapshot's age when it is stale). `/svprogress hide model` drops the line |
+| `last` | Previous turn only: its input / output split and what that turn cost |
+| `cache` | **Today's** blended hit rate: `cache_read / (input + cache_read)` over every session of the local day, `avg` tag on the right, green at 70% and above |
 | `cost` | Session cost plus delegate children. `~` = estimate from the price table, `$n/a` = unpriced |
-| `burn` | Session cost per hour over the session's own wall clock, floored at 5 minutes |
 | `saved` | Dollars the cache avoided: `cache_read` priced at list input instead of the cache rate |
 | `today` | Every session started today, from local 00:00 to 24:00, with its session count, so cron runs and parallel terminals cannot hide |
-| `tok/day` | Tokens today across every session: `input_tokens + cache_read_tokens + cache_write_tokens + output_tokens`. Cached prompts are counted, because they still went through the model |
-| `agents` | Delegate children of the tracked session and their added cost |
-| `codex` | Spend and tokens in the local codex transcripts, cost then token total |
-| `pi` | Same for pi sessions (`~/.pi/agent/sessions`) |
-| `dsh` | Same for DeepSeek Harness sessions (`~/.dsh/sessions`, read through `zstd`) |
-| `others` | The three rows above combined: money spent outside Hermes, and total tokens |
+| `tok/day` | Every token the day pushed through a model, plus the delegate share as `· 1.2M ag` |
+| `sep` | The three group separators: one after the header, one between SESSION and TODAY, one between TODAY and AGENT. `/svprogress hide sep` drops them |
 
-## Other agents
+The widget draws 18 rows in every palette and every separator style: two sky art rows, the
+`model` header line, three separators, the ten value rows above, the ground art row and the
+closing rule. A palette or separator switch recolours the block; it never changes the row
+count or any row's width.
 
-The card can see the spend of three sibling agents, because each one writes its own
-transcript on this machine:
+`burn` and `agents` were dropped: a per-hour rate and a delegate count read as noise beside
+the dollars, and the delegate share of the day's traffic fits on the `tok/day` row.
 
-| Agent | Source | Token rule | Cost rule |
-| --- | --- | --- | --- |
-| codex | `~/.codex/sessions/**/*.jsonl` | last `token_count.info.total_token_usage` per rollout | price table, else `n/a` |
-| pi | `~/.pi/agent/sessions/**/*.jsonl` | every `message.usage` row | the agent's own reported cost, else the price table |
-| dsh | `~/.dsh/sessions/**/session.jsonl.zstd` | every `assistant/chunk` usage chunk | price table, else `n/a` |
-
-A `?` after a cost means at least one model in that row has no price in the table, and that
-part is left out of the money instead of being called free. A model the agent bills itself
-(pi reports cost per response) always wins over the table.
-
-The scan costs about 0.4 s over the full history, so the hook never waits for it: a stale
-cache returns the previous numbers and one background thread refreshes them. `/svprogress`
-waits, because you asked for a printout. Results are cached in
-`$HERMES_HOME/state/savvy-progress.agents.json` for 60 s. Set `SAVVY_AGENTS_OFF=1` to skip
-the scan entirely.
-
-### `/svprogress` rows
-
-The slash card prints one line per agent plus its top three models and the combined total:
-
-```
-  other agents
-  pi      3 models          1.0M ~$0.5500?
-          · deepseek-v4.1…  1.0M ~$0.3000
-          · paid-model        15 ~$0.2500
-          · Spark-X2.6-4B…   713      $n/a
-  total 3 all models      2.0M ~$0.8500?
-```
-
-## Hiding rows
-
-Every row can be switched off. The list lives in
-`$HERMES_HOME/state/savvy-progress.rows.json` (`{"hidden": ["burn", "codex"]}`), so it
-survives a restart and one edit does the same thing as the command:
-
-| Command | Effect |
-| --- | --- |
-| `/svprogress hide burn codex` | Stop drawing those rows |
-| `/svprogress show burn` | Draw them again |
-| `/svprogress reset` | Draw every row |
-| `/svprogress rows` | Print which rows are shown and hidden |
-
-Row names are the widget keys: `model`, `api`, `tokens`, `cache`, `ctx`, `cost`, `burn`,
-`saved`, `today`, `daytok`, `codex`, `pi`, `dsh`, `others`, `agents`. `tokens` hides input,
-output and cache-read together. The spoken labels work too (`tok/day`, `delegates`,
-`context`, `calls`). A hidden row draws no line, no blank gap and no zero.
+The session token totals moved to the text card, which still prints `input`, `output` and
+`cache read` rows. The widget answers "what did the last turn cost me" instead, because the
+totals never changed fast enough to act on.
 
 `cost_source` travels with each number: `provider` is a real billed figure, `table` is an
 estimate from list prices, `none` means there is no honest number and the row prints `n/a`.
+
+## Palette (widget)
+
+Two palettes live in `THEMES` in the widget (eight foreground hexes each) plus the
+matching banner art in `ART`; the plugin owns which one is active:
+
+| Theme | Colours |
+| --- | --- |
+| `savvy` (default) | Neon night: label `#40E0D0`, value `#F5F5F5`, accent `#57E3FF`, ok `#00FF7F`, highlight `#FFD700`, warn `#FF9BD2`, error `#FF4D6D`, violet `#8E7BF0` |
+| `grove` | Green garden: label `#4E7A5A`, value `#EAF7EE`, accent `#7CE38B`, ok `#9BE564`, highlight `#C8E86A`, warn `#FFC46B`, error `#FF6B6B`, violet `#8E7BF0` |
+
+`ROLE_OF` maps every card role onto one of the eight colours: label column and ground art
+use `label`, `model` / `last` / `tok/day` use `value`, logo and both sky art rows use
+`accent`, `codex` / `pi` / `dsh` use `violet`, `cost` / `today` / `others` use `highlight`,
+`saved` and the cache gauge use `ok`. The cache row keeps its threshold: `>= 70%` draws
+`ok`, `>= 30%` `warn`, below that `error`.
+
+The banner is three rows in both themes — two sky rows above the values, one ground row
+under the last value row — so a theme switch recolours the card and never resizes it. All
+three carry the `logo` row key, so `/svprogress hide logo` drops the whole banner.
+
+The choice is stored in `$HERMES_HOME/state/savvy-progress.theme.json` as
+`{"theme": "savvy", "sep": "gem"}`, the same shape the row toggle uses, and the payload
+carries both keys. A snapshot without them, or with unknown names, draws `savvy` / `gem` —
+a stale payload never blanks the card. The printed card (`/svprogress`) draws the same three
+art lines and the same separator as the widget, so both surfaces agree.
+
+## Separator (widget)
+
+The card is a plain `Box` block, not a `Dialog`: the host hardcodes a rounded border and a
+border colour on a `Dialog`, and this block is framed by its own rules instead. Rows sit in
+a `Box` two cells wider than the 30-cell content on each side and centred, so the left and
+right gutters stay equal as rows change width; the app width carries those cells so a
+narrow rail cannot clip.
+
+Inside the rail, the card centres itself vertically: the outer `Box` takes the rail's full
+height (`height="100%"`, `flexGrow={1}`) with `justifyContent="center"`, so the leftover
+rail height splits evenly above and below. No filler rows — the rail height is not known to
+the widget, so a hardcoded pad would break on resize. Proof (real Ink, 40 and 60 rows): 11
+blank lines above and 11 below at 40 rows, 21 and 21 at 60.
+
+Each separator is one 30-cell row with the theme's glyph centred between two `─` runs, built
+from `ROW_W` and the glyph's cell count — never hand-counted, so it cannot drift:
+
+| `sep` | Row |
+| --- | --- |
+| `gem` (default) | `────────────── ◇ ─────────────` (savvy) / `───────────── ,^, ────────────` (grove) |
+| `rule` | `──────────────────────────────` |
+| `dots` | `· · · · · · · · · · · · · · ·` |
+| `shade` | `────────── ░▒▓██▓▒░ ──────────` |
 
 ## Configuration
 
@@ -123,26 +135,23 @@ code by writing `$HERMES_HOME/state/savvy-progress.prices.json`:
 An override outranks a baked row, because it is the more specific statement of intent. A
 malformed row is ignored, not fatal: the card falls back to the baked table.
 
-The baked table also carries the OpenAI GPT-6.x list rates read from the OpenRouter model
-catalogue, so the `codex` row has a price:
+### Quote bank
 
-| Model | input | output | cached input |
-| --- | --- | --- | --- |
-| `gpt-6.1-sol` | $2.00 | $10.00 | $0.10 |
-| `gpt-6.1-terra` | $1.00 | $5.00 | $0.05 |
-| `gpt-6-luna` | $0.10 | $0.50 | $0.01 |
-| `gpt-6-astra` | $10.00 | $50.00 | $1.00 |
-| `gpt-6-sol` | $2.00 | $10.00 | $0.20 |
+The card no longer prints a quote; the lines live here instead, one per day, picked from the
+local date so the same day always reads the same.
 
-`-pro` rows are twice the base rate and are matched first, because the longest key wins.
-The catalogue doubles every rate again above a 272k-token prompt; this card does not model
-that tier, so a very long call reads low. `codex-auto-review` has no public rate and stays
-`$n/a`.
-
-### Context window
-
-Read from `model.context_length` in `$HERMES_HOME/config.yaml`, cached until the file
-changes, and defaulting to 1,000,000.
+| Day seed | Quote |
+| --- | --- |
+| 0 | cache me if you can |
+| 1 | warm cache, cold brew |
+| 2 | hit rate is a love language |
+| 3 | cheap tokens, rich taste |
+| 4 | measure twice, prompt once |
+| 5 | every miss is a lesson |
+| 6 | no cache, no glory |
+| 7 | tokens are a tax on thought |
+| 8 | prompt once, read forever |
+| 9 | the cache remembers |
 
 ## Fallbacks
 
@@ -154,12 +163,6 @@ changes, and defaulting to 1,000,000.
 | State directory read-only, or a parent path is a file | The write is skipped, the previous snapshot stays valid, the hook returns normally |
 | `Infinity` / `NaN` in a cost field | Sanitised before serialisation; the file always parses as strict JSON |
 | Two Hermes processes firing at once | An advisory `flock` plus an atomic `os.replace`; a busy lock skips one write instead of interleaving |
-| A codex, pi or dsh tree missing or unreadable | That agent reports `available: false`, contributes zero tokens, and is skipped on the card |
-| A transcript over 64 MB, a line over 8 MB, a decompressed dsh log over 256 MB, or a scan over 20 s | The file or the rest of the scan is skipped, the entry is marked `truncated`, and the numbers never claim full coverage |
-| A symlink, FIFO or device under a session root | Skipped. Only regular files are read, so a FIFO cannot block the scan |
-| Negative or absurd token counts | The row is rejected instead of reaching the card |
-| Cross-agent scan slower than the turn | The hook returns the previous numbers and one background thread refreshes them; the scan is single-flight |
-| `zstd` not installed | dsh reports no data; no transcript is guessed |
 | Unpriced model | Rows print `n/a` instead of inventing a dollar figure |
 | Missing `started_at` | Burn reports 0 instead of dividing by the epoch |
 | Hostile payload (list where a count belongs) | Coerced to 0, the card still renders |
@@ -173,6 +176,14 @@ Files written by the plugin are atomic, mode `0600`, and never left as a `.tmp`.
 | `/progress` | Toggle the docked card. TUI only |
 | `/widgets-reload` | Reload `tui-widgets/*.mjs` after editing the widget. TUI only |
 | `/svprogress` | Print the card as text, in the TUI or the classic CLI |
+| `/svprogress hide logo\|cache\|last ...` | Drop one row from both surfaces |
+| `/svprogress rows` | List which rows are shown |
+| `/svprogress theme` | Print the active palette and the choices |
+| `/svprogress theme savvy\|grove` | Switch the widget palette and the printed card's art |
+| `/svprogress theme next` | Cycle to the other palette (`savvy` -> `grove` -> `savvy`) |
+| `/svprogress sep` | Print the active separator style and the choices |
+| `/svprogress sep gem\|rule\|dots\|shade` | Switch the separator on both surfaces |
+| `/svprogress sep next` | Cycle to the next separator (`gem` -> `rule` -> `dots` -> `shade`) |
 
 The docked card and `/progress` exist only in `hermes --tui`: the classic CLI has no widget
 surface, and the plugin does not pretend otherwise.
