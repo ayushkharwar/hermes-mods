@@ -170,6 +170,12 @@ PIN_TTL_S = 12 * 3600.0
 # A pinned session that ended more than 30 min ago must not hold the card.
 PIN_ENDED_STALE_S = 30 * 60.0
 
+# --- context bar -----------------------------------------------------------------
+# context_tokens is the biggest prompt this session has sent: one model row's
+# (input + cache read + cache write) divided by that row's api_call_count.
+DEFAULT_CONTEXT_WINDOW = 1_000_000
+_context_cache: Dict[str, Any] = {}
+
 _price_cache: Dict[str, Any] = {"key": None, "table": None}
 _price_match_cache: Dict[Tuple[Any, str], Optional[Tuple[float, float, float]]] = {}
 _day_cache: Dict[str, Any] = {"key": None, "value": None}
@@ -312,6 +318,14 @@ WHERE last_seen IS NOT NULL AND session_id LIKE 'local-%'
 GROUP BY session_id
 ORDER BY seen DESC
 LIMIT 1
+"""
+
+# Current prompt size: one model row's lifetime token sum over its own call count.
+_CONTEXT_SQL = """
+SELECT MAX((input_tokens + cache_read_tokens + cache_write_tokens) /
+           CASE WHEN api_call_count > 0 THEN api_call_count ELSE 1 END)
+FROM session_model_usage
+WHERE session_id = ?
 """
 
 _DELEGATE_USAGE_SQL = """
@@ -679,6 +693,22 @@ def _read_model(session_id: str) -> Tuple[str, str]:
     return model, provider
 
 
+def _read_context_tokens(session_id: str) -> int:
+    """Current prompt size of the session, in tokens.
+
+    ``input_tokens``, ``cache_read_tokens`` and ``cache_write_tokens`` are lifetime sums in
+    this schema, so their plain sum is the session's whole throughput, not its prompt: on a
+    long session it reads ~12x the 1M window. Dividing that sum by the row's
+    ``api_call_count`` gives the average prompt per call, and the max over rows is the
+    biggest prompt the session has sent. That is the number the TUI status bar tracks.
+    """
+    row = _safe_row(_CONTEXT_SQL, (session_id,))
+    try:
+        return max(0, int(row[0] or 0)) if row else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def _finite(value: Any, default: float = 0.0) -> float:
     """A finite float, or ``default``.
 
@@ -840,6 +870,56 @@ def _day_spend(now: float) -> Dict[str, Any]:
     _day_cache["key"] = key
     _day_cache["value"] = dict(result)
     return dict(result)
+
+
+def _context_window() -> int:
+    """``model.context_length`` from ``config.yaml``. Never raises, never returns 0."""
+    path = _hermes_home() / "config.yaml"
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        return DEFAULT_CONTEXT_WINDOW
+
+    if _context_cache.get("key") == key and _context_cache.get("value"):
+        return int(_context_cache["value"])
+
+    window = DEFAULT_CONTEXT_WINDOW
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+
+    if text:
+        parsed = None
+        try:
+            import yaml  # noqa: PLC0415 — optional, the regex below is the fallback
+
+            data = yaml.safe_load(text)
+            if isinstance(data, dict):
+                model_block = data.get("model")
+                if isinstance(model_block, dict):
+                    parsed = model_block.get("context_length")
+        except Exception as exc:
+            logger.debug("savvy-progress: yaml parse failed, using the regex: %s", exc)
+
+        try:
+            candidate = int(parsed) if parsed is not None else 0
+        except (TypeError, ValueError):
+            candidate = 0
+
+        if candidate <= 0:
+            match = re.search(r"^\s*context_length:\s*(\d+)\s*$", text, re.MULTILINE)
+            if match:
+                try:
+                    candidate = int(match.group(1))
+                except ValueError:
+                    candidate = 0
+        if candidate > 0:
+            window = candidate
+
+    _context_cache["key"] = key
+    _context_cache["value"] = window
+    return window
 
 
 def _day_miss_usd(now: float) -> Dict[str, Any]:
@@ -1643,8 +1723,8 @@ _others_refreshing = False
 # across restarts, and the payload carries it to the widget.
 ROWS_NAME = "savvy-progress.rows.json"
 ROW_KEYS: Tuple[str, ...] = (
-    "logo", "model", "last", "api", "tokens", "cache", "cost", "saved", "today", "daytok",
-    "codex", "pi", "dsh", "others", "sep",
+    "logo", "model", "last", "api", "tokens", "cache", "ctx", "cost", "burn", "saved",
+    "today", "daytok", "codex", "pi", "dsh", "others", "agents", "sep",
     # Extras, all behind the one `extras` switch. Individually hideable so a row that
     # earns its place can stay while the rest go back off.
     "warn", "miss", "errors", "week", "tip",
@@ -1658,6 +1738,8 @@ ROW_ALIASES: Dict[str, str] = {
     "tokens/day": "daytok",
     "tok/day": "daytok",
     "day": "today",
+    "context": "ctx",
+    "burn/hour": "burn",
     "banner": "logo",
     "art": "logo",
     "quote": "logo",
@@ -2174,6 +2256,20 @@ def _current_sep() -> str:
 def _current_extras() -> bool:
     """Whether the six experimental rows are drawn. Defaults to EXTRAS_DEFAULT."""
     return bool(_theme_settings()["extras"])
+
+
+def _payload_extras(payload: Dict[str, Any]) -> bool:
+    """The `extras` switch of the card being drawn.
+
+    The snapshot carries it, so a card rendered from a payload tells the same story as the
+    widget that payload was written for (and a test can pin the shape). A payload without
+    the key — one written before the switch existed — falls back to the saved setting.
+    """
+    value = payload.get("extras")
+    parsed = _normalize_extras(value if isinstance(value, str) else None)
+    if parsed is None and isinstance(value, bool):
+        parsed = value
+    return _current_extras() if parsed is None else parsed
 
 
 def _budget_usd() -> Optional[float]:
@@ -3226,9 +3322,12 @@ def _build_snapshot(
         "primary_session": primary_id,
         "delegates": delegates,
         "total_cost_usd": _finite(total_cost),
+        # Context bar: the biggest prompt this session has sent against the model window.
+        "context_tokens": _read_context_tokens(primary_id),
+        "context_window": _context_window(),
         # Today's blended cache hit rate: what the `cache` row draws instead of the
         # session-only rate, so the card answers "how warm is my cache today".
-        "day_cache_hit_pct": float(day["cache_hit_pct"]),
+        "day_cache_hit_pct": _finite(day.get("cache_hit_pct")),
         # Burn is the total cost over the session's own wall clock. It follows cost_source:
         # a provider number burns a real rate, a table number burns an estimate.
         "burn_usd_per_hour": _finite(burn_usd_per_hour),
@@ -3811,8 +3910,23 @@ def render_card(payload: Dict[str, Any]) -> str:
     if shown("cache"):
         # Same number the widget draws: today's blended hit rate, said out loud.
         body.append(_row("cache hit", f"{hit:.1f}%", "   today"))
+    if shown("ctx"):
+        # The biggest prompt this session sent against the model window, the same bar the
+        # widget draws. A window of zero is a damaged payload, never a division by zero.
+        ctx_tokens = max(0, _int_value(payload.get("context_tokens")))
+        ctx_window = _int_value(payload.get("context_window"))
+        if ctx_window <= 0:
+            ctx_window = DEFAULT_CONTEXT_WINDOW
+        ctx_pct = min(100.0, ctx_tokens / ctx_window * 100.0)
+        body.append(_row(
+            "context",
+            f"{_compact_tokens(ctx_tokens)}/{_compact_tokens(ctx_window)}",
+            f"   {ctx_pct:4.1f}%",
+        ))
     if shown("cost"):
         body.append(_row("cost", cost_value, suffix))
+    if shown("burn"):
+        body.append(_row("burn/hour", _rate_text(payload.get("burn_usd_per_hour"), source)))
     if shown("saved"):
         body.append(_row("cache saved", saved_value, f"   {saved_suffix}" if saved_suffix else ""))
     if shown("today"):
@@ -3824,13 +3938,23 @@ def render_card(payload: Dict[str, Any]) -> str:
             + max(0, _int_value(delegates.get("cache_read")))
         agent_tail = f"   {_compact_tokens(agent_tokens)} ag" if agent_tokens > 0 else ""
         body.append(_row("tokens/day", _thousands(payload.get("day_tokens")), agent_tail))
+    if shown("agents"):
+        # Delegate children: their count and the cost they added on top of the primary.
+        if delegate_count:
+            body.append(_row(
+                "agents",
+                _thousands(delegate_count),
+                f"   {_plus_text(delegates.get('cost_usd'), delegate_source)}",
+            ))
+        else:
+            body.append(_row("agents", "none"))
     if others_block:
         body.extend(others_block)
 
     # --- extras ------------------------------------------------------------------
     # All six, in card order, and none of them when the switch is off. The `warn` row
     # is the only conditional one: no reason means no row, never a blank line.
-    if _current_extras():
+    if _payload_extras(payload):
         warn = _warn_reason(payload)
         if warn and shown("warn"):
             reason, _tone = warn

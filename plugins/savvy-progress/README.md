@@ -14,7 +14,9 @@ PROGRESS  deepseek-v4.1-flash
 ────────────── ◇ ─────────────
 last          1.8k/2.2k ~$0.0036
 cache       ████████░░░░ 96.5% avg
+ctx         ██░░░░░░░░░░   2.9%
 cost                  ~$0.1606
+burn                  ~$0.55/h
 saved                 ~$1.9864
 ────────────── ◇ ─────────────
 today       ~$2.2493  22 chats
@@ -46,66 +48,76 @@ is handled by asking `mktime` for the next midnight.
 | `model` | The header line: `PROGRESS` in the 8-cell label column, the model tail right-aligned in the value column (plus the snapshot's age when it is stale). `/svprogress hide model` drops the line |
 | `last` | Previous turn only: its input / output split and what that turn cost |
 | `cache` | **Today's** blended hit rate: `cache_read / (input + cache_read)` over every session of the local day, `avg` tag on the right, green at 70% and above |
+| `ctx` | The context bar: the biggest prompt this session has sent (lifetime tokens over `api_call_count`, maxed across model rows) against the model window from `config.yaml` `model.context_length`, 1M when that key is absent. Green under 70%, amber to 90%, red above |
 | `cost` | Session cost plus delegate children. `~` = estimate from the price table, `$n/a` = unpriced |
+| `burn` | Dollars per hour: total cost over the session's own wall clock (floored at 5 min, so a two-minute chat is not a fake rate). `~` = estimate, `$n/a/h` = no priced cost yet |
 | `saved` | Dollars the cache avoided: `cache_read` priced at list input instead of the cache rate |
 | `today` | Every session started today, from local 00:00 to 24:00, with its session count, so cron runs and parallel terminals cannot hide |
 | `tok/day` | Every token the day pushed through a model, plus the delegate share as `· 1.2M ag` |
 | `sep` | The three group separators: one after the header, one between SESSION and TODAY, one between TODAY and AGENT. `/svprogress hide sep` drops them |
 
-The widget draws 18 rows in every palette and every separator style: two sky art rows, the
-`model` header line, three separators, the ten value rows above, the ground art row and the
-closing rule. A palette or separator switch recolours the block; it never changes the row
-count or any row's width.
+The widget draws 20 rows in every palette and every separator style: two sky art rows, the
+`model` header line, three separators, the twelve value rows above, the ground art row and
+the closing rule. A palette or separator switch recolours the block; it never changes the
+row count or any row's width.
 
-`burn` and `agents` were dropped: a per-hour rate and a delegate count read as noise beside
-the dollars, and the delegate share of the day's traffic fits on the `tok/day` row.
+`agents` is drawn by the printed card only: the delegate count and the dollars they added
+(`agents  3  +$0.0412`, or `none`). The widget folds the same two facts into `cost` (which
+always includes the children) and `tok/day` (which carries their token share), because a
+second count row beside the dollars read as noise at 22 cells.
 
-The session token totals moved to the text card, which still prints `input`, `output` and
-`cache read` rows. The widget answers "what did the last turn cost me" instead, because the
-totals never changed fast enough to act on.
+The session token totals live on the text card, which prints `input`, `output` and
+`cache read` rows; the widget's `last` row answers "what did the last turn cost me"
+instead, because the lifetime totals never changed fast enough to act on.
 
 `cost_source` travels with each number: `provider` is a real billed figure, `table` is an
 estimate from list prices, `none` means there is no honest number and the row prints `n/a`.
 
 ## Palette (widget)
 
-Two palettes live in `THEMES` in the widget (eight foreground hexes each) plus the
+Three palettes live in `THEMES` in the widget (eight foreground hexes each) plus the
 matching banner art in `ART`; the plugin owns which one is active:
 
 | Theme | Colours |
 | --- | --- |
-| `savvy` (default) | Neon night: label `#40E0D0`, value `#F5F5F5`, accent `#57E3FF`, ok `#00FF7F`, highlight `#FFD700`, warn `#FF9BD2`, error `#FF4D6D`, violet `#8E7BF0` |
+| `wine` (default) | Jungle in wine ink: label `#9A5F71`, value `#F7EFF2`, accent `#C2185B`, ok `#7BE38B`, highlight `#FFB86B`, warn `#FF9BD2`, error `#FF4D6D`, violet `#A07BE0` |
+| `savvy` | Neon night: label `#40E0D0`, value `#F5F5F5`, accent `#57E3FF`, ok `#00FF7F`, highlight `#FFD700`, warn `#FF9BD2`, error `#FF4D6D`, violet `#8E7BF0` |
 | `grove` | Green garden: label `#4E7A5A`, value `#EAF7EE`, accent `#7CE38B`, ok `#9BE564`, highlight `#C8E86A`, warn `#FFC46B`, error `#FF6B6B`, violet `#8E7BF0` |
 
-`ROLE_OF` maps every card role onto one of the eight colours: label column and ground art
-use `label`, `model` / `last` / `tok/day` use `value`, logo and both sky art rows use
-`accent`, `codex` / `pi` / `dsh` use `violet`, `cost` / `today` / `others` use `highlight`,
-`saved` and the cache gauge use `ok`. The cache row keeps its threshold: `>= 70%` draws
-`ok`, `>= 30%` `warn`, below that `error`.
+`wine` shares `grove`'s art and spine objects by reference, so the jungle glyphs cannot
+drift between the two palettes.
 
-The banner is three rows in both themes — two sky rows above the values, one ground row
+`ROLE_OF` maps every card role onto one of the eight colours: label column and ground art
+use `label`, `model` / `last` / `tok/day` / `ctx` / `burn` use `value`, logo and both sky
+art rows use `accent`, `codex` / `pi` / `dsh` use `violet`, `cost` / `today` / `others` use
+`highlight`, `saved` and the cache gauge use `ok`. The cache row keeps its threshold:
+`>= 70%` draws `ok`, `>= 30%` `warn`, below that `error`. The context bar grades the same
+way (`>= 90%` error, `>= 70%` warn).
+
+The banner is three rows in every palette — two sky rows above the values, one ground row
 under the last value row — so a theme switch recolours the card and never resizes it. All
 three carry the `logo` row key, so `/svprogress hide logo` drops the whole banner.
 
 The choice is stored in `$HERMES_HOME/state/savvy-progress.theme.json` as
-`{"theme": "savvy", "sep": "gem"}`, the same shape the row toggle uses, and the payload
-carries both keys. A snapshot without them, or with unknown names, draws `savvy` / `gem` —
-a stale payload never blanks the card. The printed card (`/svprogress`) draws the same three
-art lines and the same separator as the widget, so both surfaces agree.
+`{"theme": "wine", "sep": "gem", "extras": "on"}`, the same shape the row toggle uses, and
+the payload carries those keys. A snapshot without them, or with unknown names, draws the
+defaults — a stale payload never blanks the card. The printed card (`/svprogress`) draws the
+same three art lines and the same separator as the widget, so both surfaces agree.
 
 ## Separator (widget)
 
 The card is a plain `Box` block, not a `Dialog`: the host hardcodes a rounded border and a
-border colour on a `Dialog`, and this block is framed by its own rules instead. Rows sit in
-a `Box` two cells wider than the 30-cell content on each side and centred, so the left and
-right gutters stay equal as rows change width; the app width carries those cells so a
-narrow rail cannot clip.
+border colour on a `Dialog`, and this block is framed by its own spine instead. Each row is
+one 38-cell frame line — a 3-cell spine, a clear cell, the 30-cell body, a clear cell and
+the mirrored 3-cell spine — inside a 42-cell container with equal 2-cell gutters, so a
+hidden row shifts no glyph and no row can widen the card. The app width (44) also carries
+the rail's own `paddingX={1}` on both sides.
 
-Inside the rail, the card centres itself vertically: the outer `Box` takes the rail's full
-height (`height="100%"`, `flexGrow={1}`) with `justifyContent="center"`, so the leftover
-rail height splits evenly above and below. No filler rows — the rail height is not known to
-the widget, so a hardcoded pad would break on resize. Proof (real Ink, 40 and 60 rows): 11
-blank lines above and 11 below at 40 rows, 21 and 21 at 60.
+Inside the rail, the card does not centre itself: the host's `center-right` zone owns the
+vertical placement. An inner `height: "100%"` or `flexGrow` resolves against the card's own
+content-sized height and centres nothing, so adding one back would only hide which
+mechanism is doing the work. A host that does not advertise `center-right` gets
+`top-right`, which every build draws.
 
 Each separator is one 30-cell row with the theme's glyph centred between two `─` runs, built
 from `ROW_W` and the glyph's cell count — never hand-counted, so it cannot drift:
@@ -179,8 +191,8 @@ Files written by the plugin are atomic, mode `0600`, and never left as a `.tmp`.
 | `/svprogress hide logo\|cache\|last ...` | Drop one row from both surfaces |
 | `/svprogress rows` | List which rows are shown |
 | `/svprogress theme` | Print the active palette and the choices |
-| `/svprogress theme savvy\|grove` | Switch the widget palette and the printed card's art |
-| `/svprogress theme next` | Cycle to the other palette (`savvy` -> `grove` -> `savvy`) |
+| `/svprogress theme savvy\|grove\|wine` | Switch the widget palette and the printed card's art |
+| `/svprogress theme next` | Cycle to the next palette (`savvy` -> `grove` -> `wine` -> `savvy`) |
 | `/svprogress sep` | Print the active separator style and the choices |
 | `/svprogress sep gem\|rule\|dots\|shade` | Switch the separator on both surfaces |
 | `/svprogress sep next` | Cycle to the next separator (`gem` -> `rule` -> `dots` -> `shade`) |
@@ -190,21 +202,23 @@ surface, and the plugin does not pretend otherwise.
 
 ## Tests
 
-The suites live outside the plugin, in `~/toDelete/savvy-test/`:
+The suites live beside the repo, in `tests/savvy-progress/`:
 
 | File | Covers |
 | --- | --- |
-| `test_plugin.py` | Row maths, render edge cases, strict-JSON safety, drift detection |
+| `test_plugin.py` | The data contract (52 keys, exact shape), row maths, render edge cases, strict-JSON safety, drift detection, context window parsing |
 | `test_integration.py` | Day window edges on a synthetic DB, provider/table mixing, concurrent threads, hot-path timing |
 | `test_hardening.py` | Missing/corrupt/locked DB, wrong schema, read-only dirs, price overrides, 2000-payload fuzz, 20k-row scale |
 | `test_concurrency.py` | Four processes writing at once: valid JSON, no lost entries, no `.tmp` left |
-| `test_widget.mjs` | Row widths in every snapshot shape, `readSnapshot`/`mergeSnapshot`, age labels, register contract |
+| `test_regressions.py` | The review findings: delegate views, republication, decompressor deadlines |
+| `test_rows.py` | `hide`/`show`/`reset`, the rows file, and the extras switch on the printed card |
+| `test_agents.py` | The codex/pi/dsh scanners against synthetic transcripts |
+| `test_soak.py` | 400 repaints: no torn file, no descriptor leak, write-path timing |
+| `test_widget.mjs` | Frame widths in every snapshot shape, spine slots, extras on/off, `readSnapshot`/`mergeSnapshot`, age labels, register contract |
 
-Run them all:
+Run them all from the repo root:
 
 ```bash
-cd ~/toDelete/savvy-test
-for t in test_plugin.py test_integration.py test_hardening.py test_concurrency.py; do python3 "$t"; done
-node test_widget.mjs
-HERMES_HOME=$HOME/.hermes node live_card.mjs   # renders the card from the real snapshot
+for t in tests/savvy-progress/test_*.py; do python3 "$t"; done
+node tests/savvy-progress/test_widget.mjs
 ```

@@ -89,6 +89,10 @@ CARD = {
     "others_unpriced": True,
     "others_ts": 1_700_000_000.0,
     "turns": [],
+    # Pin the base card shape: this suite is about the row toggles, and the six extras
+    # rows have their own case below. Without the key the card follows the saved setting,
+    # which would make the row count depend on the machine running the test.
+    "extras": "off",
 }
 
 
@@ -172,6 +176,16 @@ def main() -> int:
 
     ctx_off = plugin.render_card({**CARD, "hidden_rows": ["ctx"]})
     check("hiding ctx drops the context row", "context" not in ctx_off)
+
+    # 6a. The extras switch travels in the payload, so the printed card can draw the six
+    #     experimental rows without a state-file read. `warn` needs a reason and stays out.
+    extras_card = plugin.render_card({**CARD, "extras": "on"})
+    for label in ("miss", "week", "errors", "tip"):
+        check(f"extras card prints {label}", label in extras_card,
+              extras_card.replace("\n", " | ")[:160])
+    check("extras card is taller than the base card",
+          len(extras_card.splitlines()) > len(full.splitlines()),
+          f"{len(extras_card.splitlines())} vs {len(full.splitlines())}")
 
     model_off = plugin.render_card({**CARD, "hidden_rows": ["model"]})
     check("hiding model drops the model header", "deepseek-v4.1-flash" not in model_off,

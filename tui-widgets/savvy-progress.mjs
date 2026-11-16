@@ -8,8 +8,10 @@
  *    |,  ─────────────── ◇ ──────────  `|
  *    |   last           1.8k/2.2k ~$0.0036
  *   ,|   cache   ███████░░░░░  91.7% avg
+ *    |   ctx      ██░░░░░░░░░░   8.2%
  *    |   cost          ~$0.0123
- *   '|    saved           ~$0.2401
+ *   '|   burn           ~$0.55/h
+ *    |   saved           ~$0.2401
  *    |   ─────────────── ◇ ──────────
  *    |   today      ~$2.1871  25 chats
  *   ,|   tok/day     18.4M · 1.2M ag
@@ -22,14 +24,14 @@
  *   \|/  ──────────────────────────  \|/
  *
  * The card is a FRAME, not a banner: a three-cell spine column runs down the left and the
- * right of all 18 rows, so the motif climbs the whole card. `grove` grows a vine (stem,
+ * right of all 20 rows, so the motif climbs the whole card. `grove` grows a vine (stem,
  * leaves at irregular heights, one branch that leaves the spine, roots at the base and a
  * canopy over the top); `savvy` climbs a circuit trace (nodes, branches and 90-degree
  * bends). The right spine is the left one mirrored and shifted a few rows, so the two
  * sides ornament each other instead of copy each other.
  *
- * 18 rows at every palette and every separator style: 2 canopy art rows, the header,
- * three separators, 10 value rows, the root art row and the closing rule. All three art
+ * 20 rows at every palette and every separator style: 2 canopy art rows, the header,
+ * three separators, 12 value rows, the root art row and the closing rule. All three art
  * rows carry the `logo` row key (`/svprogress hide logo` drops the canopy and the roots
  * but leaves the spine), and all three separators carry `sep` (`/svprogress hide sep`
  * drops them).
@@ -101,18 +103,21 @@ const INNER_W = FRAME_W + GUTTER * 2
 const COST_W = 8
 const PCT_W = 6
 const POLL_MS = 500
+/** Model window used when the snapshot carries no usable `context_window`: the same 1M
+ *  fallback the plugin's `DEFAULT_CONTEXT_WINDOW` uses, so both surfaces agree. */
+const DEFAULT_CONTEXT_WINDOW = 1000000
 /** Seconds one footer tip stays on screen. Overridable from the payload as `tip_s`,
  *  and picked by the same wall-clock rule the plugin uses, so both surfaces agree. */
 const TIP_S = 12
 /** Cells in the week sparkline: seven local calendar days, oldest left. */
 const WEEK_W = 7
-/** Fixed spine slots for the extras rows. The 18 base rows still take their index from
+/** Fixed spine slots for the extras rows. The 20 base rows still take their index from
  *  call order (which is what keeps the card byte-identical when extras are off); these
  *  five are pinned because `warn` is conditional and must not shift the rows under it. */
-const EXTRAS_SPINE = { miss: 8, week: 12, warn: 18, errors: 19, tip: 20 }
-/** Index of the root art row: 16 in the 18-row card, 21 once the five extras rows are
+const EXTRAS_SPINE = { miss: 10, week: 14, warn: 20, errors: 21, tip: 22 }
+/** Index of the root art row: 18 in the 20-row card, 23 once the five extras rows are
  *  in. The closing rule follows it. */
-const GROUND_AT = { off: 16, on: 21 }
+const GROUND_AT = { off: 18, on: 23 }
 /** A snapshot this old is shown with its age in the title, so stale numbers never look live. */
 const STALE_S = 120
 
@@ -161,7 +166,13 @@ export const ROLE_OF = {
   cache: 'ok',
   cacheWarn: 'warn',
   cacheError: 'error',
+  /* The context bar grades the same way and reuses the cache roles, so a palette switch
+   * never has to learn a new tone. */
+  ctx: 'value',
+  ctxWarn: 'warn',
+  ctxError: 'error',
   cost: 'highlight',
+  burn: 'value',
   saved: 'ok',
   today: 'highlight',
   daytok: 'value',
@@ -200,7 +211,7 @@ export const ART = {
   }
 }
 
-/** The LEFT spine column per palette: 18 rows of 3 cells, top to bottom. The right column
+/** The LEFT spine column per palette: 20 rows of 3 cells, top to bottom. The right column
  *  is the same list mirrored and shifted (see `spineColumns`), so nothing is hand-copied.
  *
  *  grove  a vine climbing from roots to canopy: a stem with leaves at irregular heights,
@@ -208,6 +219,9 @@ export const ART = {
  *         the base and a crown that spills over the top row.
  *  savvy  a circuit trace: nodes and 90-degree bends, with the trace turning off the spine
  *         and back on at rows 7 and 15.
+ *
+ *  Two rows were added in the middle for `ctx` and `burn`, which keeps the crown and the
+ *  roots at the same ends of the list and leaves every glyph below them in place.
  */
 export const SPINES = {
   savvy: [
@@ -217,7 +231,9 @@ export const SPINES = {
     ' │ ',
     ' ● ',
     ' │ ',
+    ' ├─',
     ' ╭─',
+    ' │ ',
     ' │ ',
     ' · ',
     ' │ ',
@@ -237,8 +253,10 @@ export const SPINES = {
     ' | ',
     '\'| ',
     ' |\\',
+    ' |^',
     '  |',
     '  |',
+    ' | ',
     ' |/',
     ',| ',
     ' | ',
@@ -284,7 +302,7 @@ export function mirrorCells(cells) {
   return [...cells].reverse().map(char => MIRROR_CHAR[char] || char).join('')
 }
 
-/** Both spine columns for one palette, 18 rows each. The right column is the left one
+/** Both spine columns for one palette, 20 rows each. The right column is the left one
  *  mirrored, shifted by SPINE_OFFSET rows inside the sleeve between the pinned ends. */
 export function spineColumns(themeName) {
   const theme = themeNameOf(themeName)
@@ -310,7 +328,7 @@ const SAVVY_TERMINALS = new Set(['·'])
 const GROVE_STEMS = new Set(['|', '─', '+', '-'])
 
 /** Spine art for the five rows the extras add past the closing rule (warn, errors, tip,
- *  the roots and the rule), per palette. Kept OUT of SPINES on purpose: SPINES stays 18
+ *  the roots and the rule), per palette. Kept OUT of SPINES on purpose: SPINES stays 20
  *  rows, so the base card keeps its exact left AND right column when extras are off
  *  instead of the mirror shift recomputing over a longer list. */
 export const EXTRAS_SPINES = {
@@ -559,7 +577,11 @@ export function resolveTone(palette, role, t) {
 const EMPTY = {
   theme: DEFAULT_THEME,
   sep: 'gem',
+  burn_source: 'none',
+  burn_usd_per_hour: 0,
   cache_hit_pct: 0,
+  context_tokens: 0,
+  context_window: DEFAULT_CONTEXT_WINDOW,
   day_cache_hit_pct: 0,
   cache_saved_source: 'none',
   cache_saved_usd: 0,
@@ -687,6 +709,21 @@ export function formatCost(value, source) {
   return (source === 'table' || source === 'agent' || source === 'estimate'
     ? `~${body}`
     : ` ${body}`).padStart(COST_W)
+}
+
+/** Burn row: dollars per hour, 2 decimals, always 22 cells. `~` = estimated from tokens,
+ *   `$n/a/h` when the session has no priced cost yet:
+ *   `            ~$0.55/h`   `              $n/a/h` */
+export function formatBurn(value, source) {
+  if (source !== 'provider' && source !== 'table' && source !== 'estimate') {
+    return '$n/a/h'.padStart(VALUE_W)
+  }
+
+  const body = `$${Math.max(0, num(value)).toFixed(2)}/h`
+
+  return (source === 'table' || source === 'agent' || source === 'estimate'
+    ? `~${body}`
+    : ` ${body}`).padStart(VALUE_W)
 }
 
 /** Saved row: dollars the cache avoided, 4 decimals like the cost row. */
@@ -875,7 +912,15 @@ function normalize(raw) {
   )
 
   return {
+    burn_source: sourceField(raw.burn_source, costSourceOf(raw)),
+    burn_usd_per_hour: Math.max(0, num(raw.burn_usd_per_hour)),
     cache_hit_pct: Math.min(100, Math.max(0, num(raw.cache_hit_pct))),
+    /* The context bar: the biggest prompt the session sent, against the model window.
+     * A window of zero (or a missing one) falls back to the 1M default, never divides. */
+    context_tokens: Math.max(0, num(raw.context_tokens)),
+    context_window: Math.floor(num(raw.context_window, DEFAULT_CONTEXT_WINDOW)) > 0
+      ? Math.floor(num(raw.context_window, DEFAULT_CONTEXT_WINDOW))
+      : DEFAULT_CONTEXT_WINDOW,
     /* The day rate is what the card draws. A snapshot from before the key existed still
      * carries the session rate, so the row never blanks on an old file. */
     day_cache_hit_pct: Math.min(
@@ -1080,7 +1125,7 @@ export function artRows(parts, themeName, t) {
  *  overrides the palette for a test; production takes it from `snap.theme`.
  *
  *  Every row is one frame line: three spine cells, a clear cell, the 30-cell body, a
- *  clear cell, three spine cells (38 cells, top to bottom 18 rows). The body keeps the
+ *  clear cell, three spine cells (38 cells, top to bottom 20 rows). The body keeps the
  *  old fixed columns, so nothing reflows while ticking; only the spine glyphs change with
  *  the palette. Each spine character is its own Text, so a leaf shades while the stem
  *  stays quiet without breaking the fixed width. */
@@ -1141,10 +1186,20 @@ export function buildRows(parts, snap, t, themeName) {
   const hit = Math.min(100, Math.max(0, num(snap.day_cache_hit_pct)))
   const hitRole = hit >= 70 ? 'cache' : hit >= 30 ? 'cacheWarn' : 'cacheError'
 
+  /* The context bar: the biggest prompt this session sent, against the model window. A
+   * window the payload cannot supply falls back to the same 1M default the plugin uses. */
+  const ctxWindowRaw = Math.floor(num(snap.context_window))
+  const ctxWindow = ctxWindowRaw > 0 ? ctxWindowRaw : DEFAULT_CONTEXT_WINDOW
+  const ctxRatio = Math.min(1, Math.max(0, num(snap.context_tokens) / ctxWindow))
+  const ctxRole = ctxRatio >= 0.9 ? 'ctxError' : ctxRatio >= 0.7 ? 'ctxWarn' : 'ctx'
+
   /* Fixed-cell field: 12 gradient gauge cells, 6-cell percent, 4-cell `avg` tag = 22
    * cells. One Text per gauge cell, so the bar is a ramp instead of one flat colour. */
   const gaugeCells = gradientGauge(hit / 100, GAUGE_W, palette)
   const pctText = `${hit.toFixed(1)}%`.padStart(PCT_W)
+  /* The same 12 + 6 field for the context bar, with a 4-cell lead pad: 22 cells exactly. */
+  const ctxCells = gradientGauge(ctxRatio, GAUGE_W, palette)
+  const ctxPct = `${(ctxRatio * 100).toFixed(1)}%`.padStart(PCT_W)
   const agentOf = name => (snap.others || []).find(entry => entry.name === name)
   const agentRole = entry => (entry && (num(entry.tokens) || num(entry.cost_usd)))
     ? 'agent'
@@ -1155,6 +1210,12 @@ export function buildRows(parts, snap, t, themeName) {
     cost_source: snap.others_source,
     unpriced: snap.others_unpriced
   }
+  /* The delegate share of the day's tokens. `normalize` folds the three parts into
+   * `delegates.tokens`; a raw payload (an old snapshot, a test seed) still has the parts,
+   * so both shapes reach the row instead of a silent zero. */
+  const delegateInfo = snap.delegates && typeof snap.delegates === 'object' ? snap.delegates : {}
+  const delegateTokens = num(delegateInfo.tokens) ||
+    (num(delegateInfo.input_tokens) + num(delegateInfo.output_tokens) + num(delegateInfo.cache_read))
 
   /* Header line: PROGRESS in the 8-cell label column, the model tail right-aligned in the
    * 22-cell value column, with the snapshot's age appended when it is stale. The value
@@ -1190,21 +1251,34 @@ export function buildRows(parts, snap, t, themeName) {
     )),
     h(Text, { key: 'cache-value', color: tone(hitRole) }, `${pctText} avg`)
   ])
+  frame('ctx', 'ctx', [
+    h(Text, { key: 'ctx-label', color: tone('label') }, 'ctx'.padEnd(LABEL_W)),
+    h(Text, { key: 'ctx-lead' }, ' '.repeat(VALUE_W - GAUGE_W - PCT_W)),
+    ...ctxCells.map((cell, index) => h(
+      Text,
+      { key: `ctx-g${index}`, color: cell.color },
+      cell.char
+    )),
+    h(Text, { key: 'ctx-value', color: tone(ctxRole) }, ctxPct)
+  ])
   row('cost', 'cost', formatCost(snap.total_cost_usd, snap.cost_source), 'cost')
+  row('burn', 'burn', formatBurn(snap.burn_usd_per_hour, snap.burn_source), 'burn')
   row('saved', 'saved', formatSaved(snap.cache_saved_usd, snap.cache_saved_source), 'saved')
   /* --- extras -------------------------------------------------------------
-   * Five rows plus the conditional warn, all behind one switch. Extras off builds none
-   * of them, so the card is the same 18 rows it was: the spine index of every base row
-   * still comes from call order and none of these slots is taken.
+   * Five rows plus the conditional warn, all behind one switch. Only an explicit 'on'
+   * builds them, the same rule `normalize` applies, so a pre-switch payload cannot draw
+   * n/a rows. Extras off builds none of them and the card is the 20 rows it always was:
+   * the spine index of every base row still comes from call order and none of these
+   * slots is taken.
    */
-  const extrasOn = snap.extras !== 'off'
+  const extrasOn = snap.extras === 'on'
 
   if (extrasOn) {
     row('miss', 'miss', formatMiss(snap.miss_usd, snap.miss_source), 'miss', 'end', EXTRAS_SPINE.miss)
   }
   sepRow('sep-2')
   row('today', 'today', formatToday(snap.day_cost_usd, snap.day_source, snap.day_sessions), 'today')
-  row('daytok', 'tok/day', formatDayTokens(snap.day_tokens, snap.delegates.tokens), 'daytok')
+  row('daytok', 'tok/day', formatDayTokens(snap.day_tokens, delegateTokens), 'daytok')
   if (extrasOn) {
     row('week', 'week', formatWeek(snap.week, snap.week_source, snap.week_total_usd),
       'week', 'end', EXTRAS_SPINE.week)

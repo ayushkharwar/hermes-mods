@@ -85,7 +85,26 @@ OTHER_KEYS = {
     # The row-toggle list the widget filters on (same branch).
     "hidden_rows",
 }
-CONTRACT_KEYS = BASE_KEYS | NEW_KEYS | SPEND_KEYS | DAY_TOKEN_KEYS | OTHER_KEYS
+# The themed build (card themes + extras) added these thirteen keys. They are part of the
+# published contract, so the exact-shape checks below cover them like every other key: a
+# payload that silently loses the palette or the extras switch would draw the wrong card.
+THEME_KEYS = {
+    # Today's blended cache hit rate: the `cache` row draws this, not the session rate.
+    "day_cache_hit_pct",
+    "theme",
+    "sep",
+    "extras",
+    "miss_usd",
+    "miss_source",
+    "day_unpriced",
+    "week",
+    "week_source",
+    "week_total_usd",
+    "errors",
+    "budget_usd",
+    "tip_s",
+}
+CONTRACT_KEYS = BASE_KEYS | NEW_KEYS | SPEND_KEYS | DAY_TOKEN_KEYS | OTHER_KEYS | THEME_KEYS
 DELEGATE_KEYS = {"count", "input_tokens", "output_tokens", "cache_read", "cost_usd", "cost_source"}
 
 COST_SOURCES = {"provider", "table", "none"}
@@ -595,9 +614,11 @@ def main() -> int:
           and "list price" not in cards["provider"])
     check("card[none] prints $n/a with no suffix",
           "$n/a" in cards["none"] and "list price" not in cards["none"] and "~" not in cards["none"])
+    # The themed card opens with two sky art rows, so the header is no longer line 0:
+    # find it instead of indexing, and keep asserting its exact text.
+    header = next((line for line in cards["table"].splitlines() if line.startswith("PROGRESS")), "")
     check("card header shows the model tail and provider",
-          cards["table"].splitlines()[0] == "PROGRESS  deepseek-v4.1-flash  custom",
-          cards["table"].splitlines()[0])
+          header == "PROGRESS  deepseek-v4.1-flash  custom", header)
 
     missing = run_command(None)
     check("a missing snapshot prints one short line",
@@ -735,7 +756,7 @@ def main() -> int:
             payload = fire(plugin, "golden-A")
             shapes.append(set(payload))
             run.append({k: v for k, v in payload.items() if k in BASE_KEYS and k != "ts"})
-    check("contract size matches the key set", len(CONTRACT_KEYS) == 39, f"n={len(CONTRACT_KEYS)}")
+    check("contract size matches the key set", len(CONTRACT_KEYS) == 52, f"n={len(CONTRACT_KEYS)}")
     check(f"every single-session payload has exactly the {len(CONTRACT_KEYS)} contract keys",
           all(shape == CONTRACT_KEYS for shape in shapes),
           f"n_keys={[len(s) for s in shapes]}")
